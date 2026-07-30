@@ -1,12 +1,15 @@
 [project]
 name = "lgd-woocommerce-catalog-scraper"
-version = "0.1.0"
+version = "0.2.0"
 description = "Resumable WooCommerce catalog, variation, taxonomy, and image exporter"
 requires-python = ">=3.10"
 dependencies = [
+  "boto3>=1.35,<2",
+  "fastapi>=0.115,<1",
   "Scrapy>=2.13,<3",
   "scrapy-playwright>=0.0.46,<1",
   "Pillow>=10,<13",
+  "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.optional-dependencies]
@@ -17,6 +20,9 @@ dev = [
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["service"]
 
 [tool.setuptools.packages.find]
 include = ["lgd_scraper*"]

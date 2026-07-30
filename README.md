@@ -8,7 +8,7 @@ This project exports the public or authorized WooCommerce catalog at
 - Variation names, IDs, SKUs, prices, stock, and attribute combinations
 - Product attributes and global attribute terms
 - Product categories and category hierarchy
-- Normalized SQLite, JSONL, CSV, and downloaded media
+- Normalized SQLite, JSONL, CSV, S3 media, and WooCommerce import sheets
 
 The crawler uses [Scrapy](https://docs.scrapy.org/en/latest/) for scheduling,
 throttling, retries, caching, and resumable jobs. It can optionally render product
@@ -60,6 +60,54 @@ python -m playwright install chromium
 
 Playwright's Chromium install is optional unless `use_playwright=true` is used.
 
+## Render Free deployment
+
+The repository includes a Docker-based Render Blueprint and a small authenticated
+control panel.
+
+1. In Render, choose **New > Blueprint**.
+2. Connect this repository.
+3. Render reads `render.yaml` and creates a Free web service in Virginia.
+4. Add the S3 and optional WooCommerce secrets listed below.
+5. Open the service URL, enter the generated `CONTROL_TOKEN`, and start with five
+   products.
+
+Render Free has an ephemeral filesystem and can stop an idle service. Keep the
+control page open while a crawl runs. The page polls live status as a normal
+user-facing operation, and S3 checkpoints preserve the normalized database every
+ten products. If Render restarts, press **Start crawl** again; the service restores
+the latest S3 checkpoint and safely upserts records.
+
+The Render container deliberately uses static HTTP/API extraction and does not
+install a Playwright browser, which keeps memory usage suitable for the Free
+instance.
+
+### Required Render environment variables
+
+Do not commit or paste secret values into source files.
+
+| Variable | Required | Description |
+|---|---:|---|
+| `CONTROL_TOKEN` | Yes | Generated automatically by the Blueprint; protects start, stop, logs, and downloads. |
+| `S3_BUCKET` | Yes | Destination bucket name. |
+| `S3_PREFIX` | Yes | Object prefix; defaults to `jewelry-product-scraper`. |
+| `AWS_ACCESS_KEY_ID` | Yes | IAM access key limited to the selected bucket/prefix. |
+| `AWS_SECRET_ACCESS_KEY` | Yes | Matching IAM secret. |
+| `AWS_REGION` | Yes | Bucket region, such as `us-east-1`. |
+| `AWS_ENDPOINT_URL` | No | Custom S3-compatible endpoint for R2, B2, MinIO, and similar providers. |
+| `S3_PUBLIC_BASE_URL` | Recommended | Public CDN/base URL ending at the media prefix, used in the WooCommerce `Images` column. |
+| `WC_CONSUMER_KEY` | Recommended | Read-only WooCommerce REST API consumer key. |
+| `WC_CONSUMER_SECRET` | Recommended | Read-only WooCommerce REST API secret. |
+
+The IAM identity needs only `s3:GetObject`, `s3:PutObject`, and
+`s3:ListBucket` for the configured prefix. Catalog archives remain private and
+are downloaded through a one-hour presigned URL.
+
+WooCommerce must be able to retrieve product images from direct online URLs.
+Prefer a CloudFront/CDN URL in `S3_PUBLIC_BASE_URL`. If the bucket is private and
+no public media URL is configured, the sheet retains the original source image
+URLs instead.
+
 ## Safe first run
 
 Start with five products:
@@ -106,6 +154,9 @@ outputs/catalog/
 ├── product-categories.csv
 ├── attributes.csv
 ├── images.csv
+├── woocommerce-products.csv
+├── woocommerce-parents.csv
+├── woocommerce-variations.csv
 ├── crawl-summary.json
 └── media/
     └── products/<product-id>/
@@ -118,6 +169,33 @@ SCRAPER_MEDIA_STORE=outputs/run-2/media \
 scrapy crawl catalog -a output_dir=outputs/run-2
 ```
 
+### WooCommerce import order
+
+The export follows WooCommerce's built-in Product CSV Importer schema.
+
+1. Import `woocommerce-parents.csv`.
+2. Import `woocommerce-variations.csv`.
+3. Alternatively, test `woocommerce-products.csv` on staging; it contains both
+   parent and variation rows in the correct order.
+
+Parent and variation SKUs are generated when the source lacks one. Category
+hierarchies use `Parent > Child`, variation rows reference the parent SKU, the
+first parent image is featured, and each variation receives its assigned image.
+Always test a small import on a staging store before importing the full catalog.
+
+### S3 object layout
+
+```text
+s3://<bucket>/<prefix>/
+├── checkpoints/catalog.sqlite
+├── latest/catalog-export.zip
+├── latest/woocommerce-products.csv
+├── latest/woocommerce-parents.csv
+├── latest/woocommerce-variations.csv
+├── media/products/<product-id>/
+└── runs/<timestamp>/
+```
+
 ## Responsible crawling
 
 - Run only where you have authorization to copy the catalog and images.
@@ -127,4 +205,3 @@ scrapy crawl catalog -a output_dir=outputs/run-2
   resolved by the site owner or hosting administrator, not bypassed.
 - Review `crawl-summary.json` and `diagnostics.jsonl` before treating an export
   as complete.
-

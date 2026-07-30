@@ -1,10 +1,13 @@
 Metadata-Version: 2.4
 Name: lgd-woocommerce-catalog-scraper
-Version: 0.1.0
+Version: 0.2.0
 Summary: Resumable WooCommerce catalog, variation, taxonomy, and image exporter
 Requires-Python: >=3.10
+Requires-Dist: boto3<2,>=1.35
+Requires-Dist: fastapi<1,>=0.115
 Requires-Dist: Scrapy<3,>=2.13
 Requires-Dist: scrapy-playwright<1,>=0.0.46
 Requires-Dist: Pillow<13,>=10
+Requires-Dist: uvicorn[standard]<1,>=0.34
 Provides-Extra: dev
 Requires-Dist: pytest<10,>=8; extra == "dev"

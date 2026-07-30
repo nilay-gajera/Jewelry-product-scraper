@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -12,6 +13,9 @@ from urllib.parse import unquote, urlparse
 
 from scrapy import Request
 from scrapy.pipelines.files import FilesPipeline
+
+from lgd_scraper.s3sync import upload_final_artifacts
+from lgd_scraper.woocommerce_csv import export_woocommerce_csvs
 
 
 def _json(value: Any) -> str:
@@ -81,6 +85,7 @@ class CatalogWriterPipeline:
         self.handles: dict[str, Any] = {}
         self.counts: Counter[str] = Counter()
         self.crawler = None
+        self.woocommerce_counts: dict[str, int] = {}
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -448,6 +453,11 @@ class CatalogWriterPipeline:
         spider = self.crawler.spider
         assert self.connection is not None
         self._export_csvs()
+        self.woocommerce_counts = export_woocommerce_csvs(
+            self.connection,
+            self.output_dir,
+            public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
+        )
         summary = {
             "base_url": getattr(spider, "base_url", None),
             "records_seen_this_run": dict(self.counts),
@@ -466,6 +476,7 @@ class CatalogWriterPipeline:
             },
             "access_blocked": bool(getattr(spider, "access_blocked", False)),
             "block_reason": getattr(spider, "block_reason", None),
+            "woocommerce_export": self.woocommerce_counts,
         }
         (self.output_dir / "crawl-summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -475,6 +486,7 @@ class CatalogWriterPipeline:
         self.connection.close()
         for handle in self.handles.values():
             handle.close()
+        upload_final_artifacts(self.output_dir)
 
     def _export_csvs(self) -> None:
         assert self.connection is not None

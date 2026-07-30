@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: jewelry-product-scraper
+    runtime: docker
+    plan: free
+    region: virginia
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - key: CONTROL_TOKEN
+        generateValue: true
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_PREFIX
+        value: jewelry-product-scraper
+      - key: S3_PUBLIC_BASE_URL
+        sync: false
+      - key: S3_MEDIA_ACL
+        value: private
+      - key: S3_UPLOAD_EVERY
+        value: "10"
+      - key: S3_RESTORE_CHECKPOINT
+        value: "1"
+      - key: S3_SERVER_SIDE_ENCRYPTION
+        value: AES256
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: us-east-1
+      - key: AWS_ENDPOINT_URL
+        sync: false
+      - key: WC_CONSUMER_KEY
+        sync: false
+      - key: WC_CONSUMER_SECRET
+        sync: false
+      - key: SCRAPER_CONCURRENCY
+        value: "2"
+      - key: SCRAPER_DOWNLOAD_DELAY
+        value: "1.0"

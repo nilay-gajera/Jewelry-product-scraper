@@ -1,8 +1,11 @@
 README.md
 pyproject.toml
+service.py
 lgd_scraper/__init__.py
 lgd_scraper/pipelines.py
+lgd_scraper/s3sync.py
 lgd_scraper/settings.py
+lgd_scraper/woocommerce_csv.py
 lgd_scraper/spiders/__init__.py
 lgd_scraper/spiders/catalog.py
 lgd_woocommerce_catalog_scraper.egg-info/PKG-INFO
@@ -11,3 +14,5 @@ lgd_woocommerce_catalog_scraper.egg-info/dependency_links.txt
 lgd_woocommerce_catalog_scraper.egg-info/requires.txt
 lgd_woocommerce_catalog_scraper.egg-info/top_level.txt
 tests/test_catalog_spider.py
+tests/test_s3sync.py
+tests/test_woocommerce_csv.py

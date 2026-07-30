@@ -43,12 +43,20 @@ DEFAULT_REQUEST_HEADERS = {
 }
 
 ITEM_PIPELINES = {
+    "lgd_scraper.s3sync.S3ArtifactPipeline": 50,
     "lgd_scraper.pipelines.CatalogMediaPipeline": 100,
     "lgd_scraper.pipelines.CatalogWriterPipeline": 300,
 }
 
 FILES_STORE = os.getenv("SCRAPER_MEDIA_STORE", "outputs/catalog/media")
 FILES_EXPIRES = 0
+FILES_STORE_S3_ACL = os.getenv("S3_MEDIA_ACL", "private")
+
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL")
+AWS_REGION_NAME = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION"))
 
 FEED_EXPORT_ENCODING = "utf-8"
 LOG_LEVEL = os.getenv("SCRAPER_LOG_LEVEL", "INFO")
