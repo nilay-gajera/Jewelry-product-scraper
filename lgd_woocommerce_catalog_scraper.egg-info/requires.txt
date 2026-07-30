@@ -1,0 +1,6 @@
+Scrapy<3,>=2.13
+scrapy-playwright<1,>=0.0.46
+Pillow<13,>=10
+
+[dev]
+pytest<10,>=8

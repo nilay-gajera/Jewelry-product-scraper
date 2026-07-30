@@ -1,0 +1,2 @@
+"""WooCommerce catalog scraper."""
+

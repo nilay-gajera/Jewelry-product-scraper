@@ -1,0 +1,5 @@
+{"_record_type":"diagnostic","kind":"products_api_unavailable","url":"https://www.loosegrowndiamond.com/wp-json/wc/store/v1/products?per_page=100&page=1","status":307,"message":"Product API was not accessible.","blocked":false}
+{"_record_type":"diagnostic","kind":"categories_api_unavailable","url":"https://www.loosegrowndiamond.com/wp-json/wc/store/v1/products/categories?per_page=100&page=1","status":307,"message":"Category API was not accessible.","blocked":false}
+{"_record_type":"diagnostic","kind":"attributes_api_unavailable","url":"https://www.loosegrowndiamond.com/wp-json/wc/store/v1/products/attributes?per_page=100&page=1","status":307,"message":"Attribute API was not accessible.","blocked":false}
+{"_record_type":"diagnostic","kind":"sitemap_unavailable","url":"https://www.loosegrowndiamond.com/wp-sitemap.xml","status":403,"message":"Sitemap could not be read (HTTP 403).","blocked":true}
+{"_record_type":"diagnostic","kind":"sitemap_unavailable","url":"https://www.loosegrowndiamond.com/sitemap_index.xml","status":403,"message":"Sitemap could not be read (HTTP 403).","blocked":true}
