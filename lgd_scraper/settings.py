@@ -52,9 +52,9 @@ FILES_STORE = os.getenv("SCRAPER_MEDIA_STORE", "outputs/catalog/media")
 FILES_EXPIRES = 0
 FILES_STORE_S3_ACL = os.getenv("S3_MEDIA_ACL", "private")
 
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+# Do not copy credentials into Scrapy settings. Scrapy prints overridden
+# settings at startup, while botocore can securely discover the same values
+# directly from the process environment.
 AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL")
 AWS_REGION_NAME = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION"))
 
