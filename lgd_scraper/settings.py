@@ -29,7 +29,7 @@ RETRY_HTTP_CODES = [408, 425, 429, 500, 502, 503, 504, 522, 524]
 
 HTTPCACHE_ENABLED = True
 HTTPCACHE_DIR = "work/httpcache"
-HTTPCACHE_IGNORE_HTTP_CODES = [401, 403, 408, 425, 429, 500, 502, 503, 504]
+HTTPCACHE_IGNORE_HTTP_CODES = [307, 401, 403, 408, 425, 429, 500, 502, 503, 504]
 
 JOBDIR = os.getenv("SCRAPER_JOBDIR", "work/jobs/catalog")
 
@@ -47,6 +47,11 @@ ITEM_PIPELINES = {
     "lgd_scraper.pipelines.CatalogMediaPipeline": 100,
     "lgd_scraper.pipelines.CatalogWriterPipeline": 300,
 }
+
+DOWNLOADER_MIDDLEWARES = {
+    "lgd_scraper.middlewares.SucuriCookieChallengeMiddleware": 650,
+}
+SUCURI_CHALLENGE_MAX_RETRIES = 2
 
 FILES_STORE = os.getenv("SCRAPER_MEDIA_STORE", "outputs/catalog/media")
 FILES_EXPIRES = 0
