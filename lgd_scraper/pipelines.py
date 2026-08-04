@@ -16,7 +16,7 @@ from scrapy.utils.asyncio import run_in_thread
 from scrapy.utils.defer import deferred_from_coro
 
 from lgd_scraper.s3sync import upload_final_artifacts
-from lgd_scraper.catalog_mutations import write_normalized_csvs
+from lgd_scraper.catalog_mutations import write_jsonl_exports, write_normalized_csvs
 from lgd_scraper.woocommerce_csv import export_woocommerce_csvs
 
 
@@ -541,6 +541,10 @@ class CatalogWriterPipeline:
     def close_spider(self):
         spider = self.crawler.spider
         assert self.connection is not None
+        self.connection.commit()
+        for handle in self.handles.values():
+            handle.close()
+        write_jsonl_exports(self.connection, self.output_dir)
         self._export_csvs()
         self.woocommerce_counts = export_woocommerce_csvs(
             self.connection,
@@ -581,10 +585,7 @@ class CatalogWriterPipeline:
             json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        self.connection.commit()
         self.connection.close()
-        for handle in self.handles.values():
-            handle.close()
         upload_final_artifacts(self.output_dir)
 
     def _export_csvs(self) -> None:

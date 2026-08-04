@@ -5,7 +5,9 @@ import html
 import json
 import os
 import re
+import sqlite3
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlencode, urljoin, urlparse
 
@@ -45,6 +47,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         consumer_key: str | None = None,
         consumer_secret: str | None = None,
         category_ids: str | Iterable[str] = "",
+        resume_existing: str | bool = False,
         *args,
         **kwargs,
     ):
@@ -69,10 +72,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             )
         )
         self.allowed_domains = [urlparse(self.base_url).hostname or ""]
+        self.resume_existing = _truthy(resume_existing)
+        self.existing_product_ids = self._load_existing_product_ids()
 
         self.products_scheduled = 0
         self.products_emitted = 0
-        self.max_close_requested = False
         self.fallback_started = False
         self.second_sitemap_attempted = False
         self.access_blocked = False
@@ -88,6 +92,27 @@ class WooCommerceCatalogSpider(scrapy.Spider):
     async def start(self):
         for request in self.start_requests():
             yield request
+
+    def _load_existing_product_ids(self) -> set[str]:
+        if not self.resume_existing:
+            return set()
+        database_path = Path(self.output_dir).resolve() / "catalog.sqlite"
+        if not database_path.exists():
+            return set()
+        try:
+            connection = sqlite3.connect(
+                f"file:{database_path}?mode=ro", uri=True, timeout=5
+            )
+            try:
+                return {
+                    str(row[0])
+                    for row in connection.execute("SELECT id FROM products").fetchall()
+                }
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            self.logger.warning("Could not read resumed product IDs: %s", exc)
+            return set()
 
     def start_requests(self):
         if self.authenticated:
@@ -157,6 +182,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             if self.max_products and self.products_scheduled >= self.max_products:
                 break
             product_id = str(raw_product.get("id") or "")
+            if product_id and product_id in self.existing_product_ids:
+                continue
             if product_id and product_id in self.seen_product_ids:
                 continue
             if product_id:
@@ -1454,14 +1481,16 @@ class WooCommerceCatalogSpider(scrapy.Spider):
 
         if self.max_products and self.products_emitted >= self.max_products:
             return
+        product_id = str(
+            product.get("id")
+            or product.get("slug")
+            or product.get("url")
+            or ""
+        )
+        if product_id and product_id in self.existing_product_ids:
+            return
         self.products_emitted += 1
         yield product
-        if self.max_products and self.products_emitted >= self.max_products:
-            crawler = getattr(self, "_crawler", None)
-            engine = getattr(crawler, "engine", None)
-            if engine is not None and not self.max_close_requested:
-                self.max_close_requested = True
-                engine.close_spider(self, "max_products")
 
     @staticmethod
     def _apply_resolved_variation_galleries(

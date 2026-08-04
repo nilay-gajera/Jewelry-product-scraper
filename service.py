@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import secrets
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -32,6 +31,7 @@ from lgd_scraper.admin_data import (
     storage_settings,
 )
 from lgd_scraper.catalog_mutations import (
+    build_catalog_archive,
     copy_database,
     delete_products,
     rebuild_catalog_artifacts,
@@ -341,9 +341,11 @@ def _clear_local_catalog() -> None:
 def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
     exit_code = current_process.wait()
     summary = _read_json(EXPORT_DIR / "crawl-summary.json")
-    archive = EXPORT_DIR / "catalog-export.zip"
-    archive.unlink(missing_ok=True)
-    shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=EXPORT_DIR)
+    archive_error = None
+    try:
+        build_catalog_archive(EXPORT_DIR)
+    except Exception as exc:
+        archive_error = str(exc)
     upload_error = _read_json(EXPORT_DIR / "s3-upload-error.json")
     successful = exit_code == 0 and not upload_error
     access_warning = bool(
@@ -361,7 +363,7 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
             else "stopped"
             if requested_stop
             else "completed_with_warnings"
-            if successful and access_warning
+            if successful and (access_warning or archive_error)
             else "completed"
             if successful
             else "failed"
@@ -375,6 +377,8 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
                 "message": (
                     "Crawl stopped. Partial catalog data was checkpointed."
                     if final_state == "stopped"
+                    else f"Crawl completed, but the local archive could not be rebuilt: {archive_error}"
+                    if successful and archive_error
                     else "Crawl completed, but the source blocked one or more requests. Review diagnostics before importing."
                     if successful and access_warning
                     else "Crawl completed. Review products or download the export."
@@ -434,7 +438,10 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
         config = _merged_start_settings(request)
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         if config["resume_checkpoint"]:
-            checkpoint_restored = download_checkpoint(EXPORT_DIR)
+            try:
+                checkpoint_restored = download_checkpoint(EXPORT_DIR, strict=True)
+            except RuntimeError as exc:
+                raise HTTPException(502, str(exc)) from exc
         else:
             _clear_local_catalog()
             checkpoint_restored = False
@@ -457,6 +464,8 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
             f"category_ids={','.join(config['category_ids'])}",
             "-a",
             f"enrich_html={'true' if config['enrich_html'] else 'false'}",
+            "-a",
+            f"resume_existing={'true' if config['resume_checkpoint'] and DATABASE_PATH.exists() else 'false'}",
             "-a",
             "use_playwright=false",
         ]
@@ -613,13 +622,18 @@ def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, An
         DATABASE_PATH.with_name(f"{DATABASE_PATH.name}-shm").unlink(missing_ok=True)
         candidate.replace(DATABASE_PATH)
 
-    artifact_summary = rebuild_catalog_artifacts(DATABASE_PATH, EXPORT_DIR)
-    latest_artifacts_updated = False
     artifact_error = None
     try:
-        latest_artifacts_updated = upload_latest_artifacts(EXPORT_DIR)
+        artifact_summary = rebuild_catalog_artifacts(DATABASE_PATH, EXPORT_DIR)
     except Exception as exc:
-        artifact_error = str(exc)
+        artifact_error = f"Catalog exports could not be rebuilt: {exc}"
+        artifact_summary = {"database_counts": catalog_summary(DATABASE_PATH)}
+    latest_artifacts_updated = False
+    if artifact_error is None:
+        try:
+            latest_artifacts_updated = upload_latest_artifacts(EXPORT_DIR)
+        except Exception as exc:
+            artifact_error = str(exc)
 
     media_deleted = 0
     media_error = None

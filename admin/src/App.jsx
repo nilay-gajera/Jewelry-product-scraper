@@ -34,15 +34,19 @@ export function App() {
   }, []);
 
   const refreshStatus = useCallback(async () => {
-    const [nextStatus, nextLogs, nextProducts] = await Promise.all([
-      api("/api/status"),
-      api("/api/logs"),
-      api("/api/products?page_size=5"),
-    ]);
+    const nextStatus = await api("/api/status");
     setStatus(nextStatus);
-    setLogs(nextLogs);
-    setProducts(nextProducts);
-  }, []);
+    if (page === "overview") {
+      const [nextLogs, nextProducts] = await Promise.all([
+        api("/api/logs"),
+        api("/api/products?page_size=5"),
+      ]);
+      setLogs(nextLogs);
+      setProducts(nextProducts);
+    } else if (page === "runs") {
+      setLogs(await api("/api/logs"));
+    }
+  }, [page]);
 
   const loadInitial = useCallback(async () => {
     const [nextStatus, nextSettings, nextProducts, nextLogs] = await Promise.all([
@@ -129,13 +133,14 @@ export function App() {
 
   if (checking) return <div className="boot-screen">Loading Jewelry Scraper…</div>;
   if (!authenticated) return <Login onAuthenticated={authenticatedLogin} />;
+  const crawlActive = status?.state === "running" || status?.state === "stopping";
 
   return <AppShell page={page} onNavigate={navigate} onLogout={logout}>
     {notice ? <div className={`toast toast--${notice.tone}`} role="status"><span>{notice.message}</span><button onClick={() => setNotice(null)}>Dismiss</button></div> : null}
     {page === "overview" ? <OverviewPage status={status} settings={settings} products={products} logs={logs} busy={busy} onStart={start} onStop={stop} onDownload={download} onNavigate={navigate} /> : null}
-    {page === "products" ? <ProductsPage initialProductId={initialProductId} onError={showError} onDeleted={handleProductsDeleted} /> : null}
+    {page === "products" ? <ProductsPage initialProductId={initialProductId} crawlActive={crawlActive} onError={showError} onDeleted={handleProductsDeleted} /> : null}
     {page === "runs" ? <RunsPage status={status} settings={settings} logs={logs} onStart={start} onStop={stop} onError={showError} /> : null}
     {page === "settings" ? <SettingsPage settings={settings} onSaved={(value) => { setSettings(value); setNotice({ tone: "success", message: "Settings saved to local runtime and S3." }); }} onError={showError} /> : null}
-    {page === "exports" ? <ExportsPage status={status} onError={showError} /> : null}
+    {page === "exports" ? <ExportsPage status={status} settings={settings} onError={showError} /> : null}
   </AppShell>;
 }

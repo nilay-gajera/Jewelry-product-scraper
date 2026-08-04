@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 from collections import OrderedDict
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -413,16 +414,14 @@ def export_woocommerce_csvs(
     """Create WooCommerce core-importer CSVs from normalized catalog data."""
 
     category_paths = _category_paths(connection)
-    products = [
-        json.loads(raw_json)
-        for (raw_json,) in connection.execute(
-            "SELECT raw_json FROM products ORDER BY id"
-        ).fetchall()
-    ]
-    maximum_attributes = max(
-        (len(_attribute_defs(product)) for product in products),
-        default=0,
-    )
+    maximum_attributes = 0
+    for (raw_json,) in connection.execute(
+        "SELECT raw_json FROM products ORDER BY id"
+    ):
+        maximum_attributes = max(
+            maximum_attributes,
+            len(_attribute_defs(json.loads(raw_json))),
+        )
     attribute_columns: list[str] = []
     for index in range(1, maximum_attributes + 1):
         attribute_columns.extend(
@@ -436,44 +435,56 @@ def export_woocommerce_csvs(
         )
     columns = BASE_COLUMNS + attribute_columns
 
-    parent_rows: list[dict[str, Any]] = []
-    variation_rows: list[dict[str, Any]] = []
-    for product in products:
-        definitions = _attribute_defs(product)
-        parent = _base_product_row(
-            connection, product, category_paths, public_base_url
-        )
-        for index, definition in enumerate(definitions, 1):
-            parent[f"Attribute {index} name"] = definition["name"]
-            parent[f"Attribute {index} value(s)"] = ", ".join(definition["values"])
-            parent[f"Attribute {index} default"] = definition["default"]
-            parent[f"Attribute {index} visible"] = definition["visible"]
-            parent[f"Attribute {index} global"] = definition["global"]
-        parent_rows.append(parent)
-
-        for variation in product.get("variations") or []:
-            variation_rows.append(
-                _variation_row(
-                    product, variation, definitions, public_base_url
+    parent_count = 0
+    variation_count = 0
+    filenames = (
+        "woocommerce-products.csv",
+        "woocommerce-parents.csv",
+        "woocommerce-variations.csv",
+    )
+    with ExitStack() as stack:
+        writers: dict[str, csv.DictWriter] = {}
+        for filename in filenames:
+            handle = stack.enter_context(
+                (output_dir / filename).open(
+                    "w", encoding="utf-8-sig", newline=""
                 )
             )
-
-    outputs = {
-        "woocommerce-products.csv": parent_rows + variation_rows,
-        "woocommerce-parents.csv": parent_rows,
-        "woocommerce-variations.csv": variation_rows,
-    }
-    for filename, rows in outputs.items():
-        with (output_dir / filename).open(
-            "w", encoding="utf-8-sig", newline=""
-        ) as handle:
             writer = csv.DictWriter(
                 handle, fieldnames=columns, extrasaction="ignore"
             )
             writer.writeheader()
-            writer.writerows(rows)
+            writers[filename] = writer
+
+        for (raw_json,) in connection.execute(
+            "SELECT raw_json FROM products ORDER BY id"
+        ):
+            product = json.loads(raw_json)
+            definitions = _attribute_defs(product)
+            parent = _base_product_row(
+                connection, product, category_paths, public_base_url
+            )
+            for index, definition in enumerate(definitions, 1):
+                parent[f"Attribute {index} name"] = definition["name"]
+                parent[f"Attribute {index} value(s)"] = ", ".join(
+                    definition["values"]
+                )
+                parent[f"Attribute {index} default"] = definition["default"]
+                parent[f"Attribute {index} visible"] = definition["visible"]
+                parent[f"Attribute {index} global"] = definition["global"]
+            writers["woocommerce-products.csv"].writerow(parent)
+            writers["woocommerce-parents.csv"].writerow(parent)
+            parent_count += 1
+
+            for variation in product.get("variations") or []:
+                variation_row = _variation_row(
+                    product, variation, definitions, public_base_url
+                )
+                writers["woocommerce-products.csv"].writerow(variation_row)
+                writers["woocommerce-variations.csv"].writerow(variation_row)
+                variation_count += 1
 
     return {
-        "parent_rows": len(parent_rows),
-        "variation_rows": len(variation_rows),
+        "parent_rows": parent_count,
+        "variation_rows": variation_count,
     }

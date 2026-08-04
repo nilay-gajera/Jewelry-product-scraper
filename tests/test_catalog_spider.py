@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import sqlite3
 from urllib.parse import parse_qs, urlparse
 
 from scrapy.http import HtmlResponse, Request
@@ -247,6 +248,53 @@ def test_product_limit_is_enforced_for_resumed_detail_requests():
 
     assert [product["id"] for product in products] == ["1", "2"]
     assert spider.products_emitted == 2
+
+
+def test_checkpoint_resume_skips_existing_ids_and_emits_only_new_products(tmp_path):
+    database = tmp_path / "catalog.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE products (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO products VALUES ('42')")
+    connection.commit()
+    connection.close()
+    spider = WooCommerceCatalogSpider(
+        output_dir=str(tmp_path), resume_existing=True, enrich_html=False
+    )
+    request = Request(
+        "https://example.test/wp-json/wc/store/v1/products?per_page=100&page=1",
+        meta={"api_kind": "store", "page": 1},
+    )
+    response = HtmlResponse(
+        url=request.url,
+        body=json.dumps(
+            [
+                {"id": 42, "name": "Already stored"},
+                {"id": 43, "name": "New product"},
+            ]
+        ).encode(),
+        encoding="utf-8",
+        request=request,
+    )
+
+    products = [
+        item
+        for item in spider.parse_products_api(response)
+        if isinstance(item, dict) and item.get("_record_type") == "product"
+    ]
+
+    assert spider.existing_product_ids == {"42"}
+    assert [str(product["id"]) for product in products] == ["43"]
+    assert spider.products_scheduled == 1
+
+
+def test_product_limit_does_not_close_taxonomy_requests_early():
+    spider = WooCommerceCatalogSpider(max_products=1)
+    spider._crawler = type("Crawler", (), {"engine": type("Engine", (), {})()})()
+
+    emitted = list(spider._emit_product({"id": "1", "_record_type": "product"}))
+
+    assert len(emitted) == 1
+    assert spider.products_emitted == 1
 
 
 def test_variation_gallery_reads_store_extensions_and_preserves_attachment_ids():

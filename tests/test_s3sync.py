@@ -17,6 +17,14 @@ class FakeS3Client:
         return f"https://signed.test/{Params['Bucket']}/{Params['Key']}?ttl={ExpiresIn}"
 
 
+class DownloadS3Client:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def download_file(self, bucket, key, filename):
+        Path(filename).write_bytes(self.payload)
+
+
 def test_uploads_checkpoint_final_archive_and_manifest(tmp_path, monkeypatch):
     monkeypatch.setenv("S3_BUCKET", "catalog-bucket")
     monkeypatch.setenv("S3_PREFIX", "exports/jewelry")
@@ -44,6 +52,14 @@ def test_uploads_checkpoint_final_archive_and_manifest(tmp_path, monkeypatch):
     assert "exports/jewelry/latest/catalog-export.zip" in keys
     assert "exports/jewelry/latest/s3-upload.json" in keys
     assert (tmp_path / "s3-upload.json").exists()
+
+
+def test_large_catalog_checkpoint_interval_defaults_to_one_hundred(monkeypatch):
+    monkeypatch.delenv("S3_UPLOAD_EVERY", raising=False)
+
+    pipeline = s3sync.S3ArtifactPipeline()
+
+    assert pipeline.upload_every == 100
 
 
 def test_private_media_presigned_url_uses_media_prefix(monkeypatch):
@@ -99,3 +115,66 @@ def test_delete_media_objects_uses_scoped_s3_keys(monkeypatch):
             },
         }
     ]
+
+
+def test_checkpoint_restore_validates_then_atomically_replaces_database(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.sqlite"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE products (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO products VALUES ('new')")
+    connection.commit()
+    connection.close()
+
+    output = tmp_path / "output"
+    output.mkdir()
+    target = output / "catalog.sqlite"
+    target.write_bytes(b"old catalog remains until validation succeeds")
+    (output / "catalog.sqlite-wal").write_bytes(b"stale wal")
+    (output / "catalog.sqlite-shm").write_bytes(b"stale shm")
+    monkeypatch.setenv("S3_BUCKET", "catalog-bucket")
+    monkeypatch.setattr(
+        s3sync, "s3_client", lambda: DownloadS3Client(source.read_bytes())
+    )
+
+    assert s3sync.download_checkpoint(output) is True
+
+    restored = sqlite3.connect(target)
+    assert restored.execute("SELECT id FROM products").fetchone()[0] == "new"
+    restored.close()
+    assert not (output / "catalog.sqlite-wal").exists()
+    assert not (output / "catalog.sqlite-shm").exists()
+    assert not list(output.glob(".catalog-checkpoint-*.sqlite"))
+
+
+def test_invalid_checkpoint_never_damages_existing_database(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    output.mkdir()
+    target = output / "catalog.sqlite"
+    original = b"existing catalog"
+    target.write_bytes(original)
+    monkeypatch.setenv("S3_BUCKET", "catalog-bucket")
+    monkeypatch.setattr(
+        s3sync, "s3_client", lambda: DownloadS3Client(b"not sqlite")
+    )
+
+    assert s3sync.download_checkpoint(output) is False
+    assert target.read_bytes() == original
+    assert not list(output.glob(".catalog-checkpoint-*.sqlite"))
+
+
+def test_strict_checkpoint_restore_refuses_to_start_from_corrupt_data(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("S3_BUCKET", "catalog-bucket")
+    monkeypatch.setattr(
+        s3sync, "s3_client", lambda: DownloadS3Client(b"not sqlite")
+    )
+
+    try:
+        s3sync.download_checkpoint(tmp_path, strict=True)
+    except RuntimeError as error:
+        assert "was not started" in str(error)
+    else:
+        raise AssertionError("strict restore accepted a corrupt checkpoint")

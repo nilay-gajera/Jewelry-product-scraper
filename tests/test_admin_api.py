@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import zipfile
 
 import pytest
 from fastapi import HTTPException
@@ -11,7 +12,12 @@ from fastapi.testclient import TestClient
 import service
 from lgd_scraper import admin_data
 from lgd_scraper.admin_data import catalog_summary, list_products, product_detail
-from lgd_scraper.catalog_mutations import copy_database, delete_product, delete_products
+from lgd_scraper.catalog_mutations import (
+    build_catalog_archive,
+    copy_database,
+    delete_product,
+    delete_products,
+)
 
 
 def _catalog(path):
@@ -156,6 +162,59 @@ def test_admin_data_summary_list_and_detail(tmp_path, monkeypatch):
     assert detail is not None
     assert detail["quality"]["complete"] is True
     assert detail["media"][0]["display_url"].startswith("https://cdn.test/")
+
+
+def test_catalog_summary_uses_normalized_relationships_without_parsing_every_product(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "catalog.sqlite"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE products (id TEXT PRIMARY KEY, product_type TEXT, raw_json TEXT);
+        CREATE TABLE variations (product_id TEXT, id TEXT);
+        CREATE TABLE images (product_id TEXT, source_url TEXT);
+        CREATE TABLE product_categories (product_id TEXT, category_id TEXT);
+        CREATE TABLE product_attributes (product_id TEXT, attribute_key TEXT);
+        CREATE TABLE categories (id TEXT);
+        CREATE TABLE attributes (id TEXT);
+        CREATE TABLE diagnostics (raw_json TEXT);
+        INSERT INTO products VALUES ('complete', 'variable', 'not parsed');
+        INSERT INTO products VALUES ('missing', 'variable', 'not parsed');
+        INSERT INTO variations VALUES ('complete', 'v1');
+        INSERT INTO images VALUES ('complete', 'https://example.test/image.jpg');
+        INSERT INTO product_categories VALUES ('complete', 'rings');
+        INSERT INTO product_attributes VALUES ('complete', 'metal');
+        """
+    )
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(
+        admin_data,
+        "_json",
+        lambda *args: (_ for _ in ()).throw(AssertionError("raw JSON was parsed")),
+    )
+
+    summary = catalog_summary(database)
+
+    assert summary["products"] == 2
+    assert summary["quality"] == {
+        "missing_images": 1,
+        "missing_categories": 1,
+        "missing_attributes": 1,
+        "missing_variations": 1,
+    }
+
+
+def test_catalog_archive_is_atomic_and_never_contains_itself(tmp_path):
+    (tmp_path / "products.csv").write_text("id\n99\n", encoding="utf-8")
+    (tmp_path / "catalog-export.zip").write_bytes(b"old archive")
+
+    archive = build_catalog_archive(tmp_path)
+
+    with zipfile.ZipFile(archive) as zipped:
+        assert zipped.namelist() == ["products.csv"]
+        assert zipped.read("products.csv") == b"id\n99\n"
 
 
 def test_admin_images_use_private_s3_signed_url_when_cdn_is_placeholder(
@@ -313,6 +372,40 @@ def test_process_watcher_records_requested_stop(tmp_path, monkeypatch):
     assert state["exit_code"] == -15
 
 
+def test_process_watcher_finishes_with_warning_when_local_archive_fails(
+    tmp_path, monkeypatch
+):
+    class FinishedProcess:
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    export = tmp_path / "export"
+    export.mkdir()
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"state": "running", "run_id": "run-archive"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "STATUS_PATH", status_path)
+    monkeypatch.setattr(service, "process", FinishedProcess())
+    monkeypatch.setattr(service, "save_json_object", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        service,
+        "build_catalog_archive",
+        lambda *args: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    service._watch_process(service.process, "run-archive")
+
+    state = json.loads(status_path.read_text(encoding="utf-8"))
+    assert state["state"] == "completed_with_warnings"
+    assert "disk full" in state["message"]
+
+
 def test_product_deletion_uses_a_copy_and_removes_related_records(tmp_path):
     source = tmp_path / "source.sqlite"
     candidate = tmp_path / "candidate.sqlite"
@@ -414,6 +507,38 @@ def test_failed_checkpoint_upload_leaves_active_catalog_untouched(
 
     assert error.value.status_code == 502
     assert catalog_summary(database)["products"] == 1
+
+
+def test_failed_artifact_rebuild_reports_warning_after_durable_delete(
+    tmp_path, monkeypatch
+):
+    export = tmp_path / "export"
+    export.mkdir()
+    database = export / "catalog.sqlite"
+    _catalog(database)
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+    monkeypatch.setattr(service, "process", None)
+    monkeypatch.setattr(service, "upload_database_checkpoint", lambda path: True)
+    monkeypatch.setattr(
+        service,
+        "rebuild_catalog_artifacts",
+        lambda *args: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    latest_calls = []
+    monkeypatch.setattr(
+        service,
+        "upload_latest_artifacts",
+        lambda *args: latest_calls.append(True) or True,
+    )
+
+    result = service.remove_product("99", delete_media=False)
+
+    assert result["deleted"] is True
+    assert "disk full" in result["artifact_error"]
+    assert result["catalog"]["products"] == 0
+    assert latest_calls == []
+    assert catalog_summary(database)["products"] == 0
 
 
 def test_delete_candidate_uses_database_filesystem(tmp_path, monkeypatch):

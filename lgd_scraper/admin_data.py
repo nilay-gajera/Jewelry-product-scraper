@@ -204,6 +204,12 @@ def catalog_summary(database_path: Path) -> dict[str, Any]:
     if connection is None:
         return empty
     try:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
         for key, table in (
             ("products", "products"),
             ("variations", "variations"),
@@ -212,16 +218,53 @@ def catalog_summary(database_path: Path) -> dict[str, Any]:
             ("attributes", "attributes"),
             ("diagnostics", "diagnostics"),
         ):
-            empty[key] = connection.execute(
-                f"SELECT COUNT(*) FROM {table}"
-            ).fetchone()[0]
-        rows = connection.execute("SELECT raw_json FROM products").fetchall()
-        for row in rows:
-            product = _json(row["raw_json"], {})
-            missing = set(quality_for(product)["missing"])
-            for field in ("images", "categories", "attributes", "variations"):
-                if field in missing:
-                    empty["quality"][f"missing_{field}"] += 1
+            if table in table_names:
+                empty[key] = connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+
+        relationship_tables = {
+            "images",
+            "product_categories",
+            "product_attributes",
+            "variations",
+        }
+        if relationship_tables.issubset(table_names):
+            checks = {
+                "missing_images": """
+                    SELECT COUNT(*) FROM products p
+                    WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id)
+                """,
+                "missing_categories": """
+                    SELECT COUNT(*) FROM products p
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM product_categories pc WHERE pc.product_id = p.id
+                    )
+                """,
+                "missing_attributes": """
+                    SELECT COUNT(*) FROM products p
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM product_attributes pa WHERE pa.product_id = p.id
+                    )
+                """,
+                "missing_variations": """
+                    SELECT COUNT(*) FROM products p
+                    WHERE p.product_type = 'variable'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM variations v WHERE v.product_id = p.id
+                      )
+                """,
+            }
+            for key, query in checks.items():
+                empty["quality"][key] = connection.execute(query).fetchone()[0]
+        else:
+            rows = connection.execute("SELECT raw_json FROM products").fetchall()
+            for row in rows:
+                product = _json(row["raw_json"], {})
+                missing = set(quality_for(product)["missing"])
+                for field in ("images", "categories", "attributes", "variations"):
+                    if field in missing:
+                        empty["quality"][f"missing_{field}"] += 1
         return empty
     finally:
         connection.close()

@@ -5,7 +5,7 @@ import { Icon } from "../icons.jsx";
 import { Button, EmptyState, LoadingLine, formatDate } from "../components/Ui.jsx";
 import { ProductThumb } from "./OverviewPage.jsx";
 
-export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
+export function ProductsPage({ initialProductId = "", crawlActive = false, onError, onDeleted }) {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [type, setType] = useState("");
@@ -34,11 +34,18 @@ export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
   useEffect(() => {
     if (!selectedId) { setDetail(null); return; }
     let active = true;
+    setDetail(null);
     api(`/api/products/${encodeURIComponent(selectedId)}`)
       .then((value) => { if (active) setDetail(value); })
-      .catch(onError);
+      .catch((error) => { if (active) setDetail(null); onError(error); });
     return () => { active = false; };
   }, [selectedId, onError]);
+
+  useEffect(() => {
+    if (!crawlActive) return;
+    setSelectedIds(new Set());
+    setConfirmingBulkDelete(false);
+  }, [crawlActive]);
 
   const pages = Math.max(1, Math.ceil(data.total / data.page_size));
   const visibleIds = useMemo(() => data.items.map((product) => String(product.id)), [data.items]);
@@ -113,22 +120,23 @@ export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
           <div className="product-toolbar">
             <label className="search-control"><Icon name="search" /><input placeholder="Search by name, SKU, or source ID…" value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); setSelectedIds(new Set()); }} /></label>
             <label className="select-control"><Icon name="filter" /><select value={type} onChange={(event) => { setType(event.target.value); setPage(1); setSelectedIds(new Set()); }}><option value="">All types</option><option value="simple">Simple</option><option value="variable">Variable</option><option value="variation">Variation</option></select></label>
-            {selectedIds.size ? <div className="product-toolbar__bulk"><span><strong>{selectedIds.size}</strong> product{selectedIds.size === 1 ? "" : "s"} selected</span><button onClick={() => setSelectedIds(new Set())}>Clear selection</button><Button icon="trash" tone="danger" onClick={() => setConfirmingBulkDelete(true)}>Delete selected</Button></div> : null}
+            {selectedIds.size && !crawlActive ? <div className="product-toolbar__bulk"><span><strong>{selectedIds.size}</strong> product{selectedIds.size === 1 ? "" : "s"} selected</span><button onClick={() => setSelectedIds(new Set())}>Clear selection</button><Button icon="trash" tone="danger" onClick={() => setConfirmingBulkDelete(true)}>Delete selected</Button></div> : null}
           </div>
+          {crawlActive ? <div className="security-notice"><Icon name="alert" /><span><strong>Catalog crawl in progress.</strong> Product deletion and selection are disabled until the checkpoint is closed safely.</span></div> : null}
           {loading ? <LoadingLine /> : null}
-          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th className="product-select"><input type="checkbox" checked={allVisibleSelected} onChange={toggleVisibleProducts} aria-label="Select all products on this page" /></th><th>Product</th><th>Type</th><th>Variations</th><th>Images</th><th>Categories</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
-            {data.items.map((product) => { const productId = String(product.id); return <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td className="product-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedIds.has(productId)} onChange={() => toggleProduct(productId)} aria-label={`Select ${product.name || product.id}`} /></td><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>; })}
+          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th className="product-select"><input type="checkbox" disabled={crawlActive} checked={allVisibleSelected} onChange={toggleVisibleProducts} aria-label="Select all products on this page" /></th><th>Product</th><th>Type</th><th>Variations</th><th>Images</th><th>Categories</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
+            {data.items.map((product) => { const productId = String(product.id); return <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td className="product-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={crawlActive} checked={selectedIds.has(productId)} onChange={() => toggleProduct(productId)} aria-label={`Select ${product.name || product.id}`} /></td><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>; })}
           </tbody></table></div> : <EmptyState title="No matching products" body="Change the filter or run the scraper to populate products." />}
           <footer className="pagination"><span>{data.total ? `${(page - 1) * data.page_size + 1}–${Math.min(page * data.page_size, data.total)} of ${data.total}` : "0 products"}</span><div><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)} aria-label="Previous page"><Icon name="chevron" className="icon-reverse" /></button><strong>{page}</strong><button disabled={page >= pages} onClick={() => setPage((value) => value + 1)} aria-label="Next page"><Icon name="chevron" /></button></div></footer>
         </section>
-        {selectedId ? <ProductInspector product={detail} onClose={() => setSelectedId("")} onDelete={deleteSelectedProduct} onError={onError} /> : null}
+        {selectedId ? <ProductInspector product={detail} crawlActive={crawlActive} onClose={() => setSelectedId("")} onDelete={deleteSelectedProduct} onError={onError} /> : null}
       </div>
       {confirmingBulkDelete ? <DeleteDialog bulk count={selectedIds.size} deleteMedia={bulkDeleteMedia} setDeleteMedia={setBulkDeleteMedia} busy={bulkDeleting} onCancel={() => setConfirmingBulkDelete(false)} onConfirm={deleteSelectedProducts} /> : null}
     </main>
   );
 }
 
-function ProductInspector({ product, onClose, onDelete, onError }) {
+function ProductInspector({ product, crawlActive, onClose, onDelete, onError }) {
   const [tab, setTab] = useState("overview");
   const [selectedVariation, setSelectedVariation] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -158,7 +166,7 @@ function ProductInspector({ product, onClose, onDelete, onError }) {
 
   return (
     <aside className="product-inspector">
-      <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><div className="inspector-actions">{product ? <button className="icon-button icon-button--danger" onClick={() => setConfirmingDelete(true)} aria-label="Delete product"><Icon name="trash" /></button> : null}<button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></div></header>
+      <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><div className="inspector-actions">{product && !crawlActive ? <button className="icon-button icon-button--danger" onClick={() => setConfirmingDelete(true)} aria-label="Delete product"><Icon name="trash" /></button> : null}<button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></div></header>
       {!product ? <LoadingLine /> : <>
         <div className="inspector-hero">{featured ? <img src={featured.display_url || featured.source_url} alt={featured.alt || product.name || "Product"} /> : <span><Icon name="image" size={38} /></span>}</div>
         <div className="media-rail">{activeMedia.slice(0, 8).map((item) => <img key={item.source_url} src={item.display_url || item.source_url} alt={item.alt || ""} loading="lazy" />)}{activeMedia.length > 8 ? <span>+{activeMedia.length - 8}</span> : null}</div>

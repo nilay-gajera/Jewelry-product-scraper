@@ -10,6 +10,8 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
   const [selected, setSelected] = useState(status || null);
   const [discovery, setDiscovery] = useState({ total_products: 0, woocommerce_products: 0, categories: [] });
   const [discovering, setDiscovering] = useState(false);
+  const active = status?.state === "running" || status?.state === "stopping";
+  const displayedConfig = active && status?.config ? status.config : config;
   useEffect(() => setConfig(settings?.crawl || {}), [settings]);
   useEffect(() => { api("/api/runs").then((value) => setRuns(value.items || [])).catch(onError); }, [status?.state, onError]);
   useEffect(() => { api("/api/discovery").then(setDiscovery).catch(onError); }, [onError]);
@@ -34,24 +36,24 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
       setDiscovery(value);
     } catch (error) { onError(error); } finally { setDiscovering(false); }
   }
-  const active = status?.state === "running" || status?.state === "stopping";
-  const selectedIds = new Set(config.category_ids || []);
+  const selectedIds = new Set(displayedConfig.category_ids || []);
   const selectedCount = (discovery.categories || []).reduce((total, category) => total + (selectedIds.has(category.id) ? Number(category.count || 0) : 0), 0);
 
   return <main className="page">
     <header className="page-header"><div><h1>Crawl runs</h1><p>Configure, resume, and audit full or test catalog runs.</p></div><Button icon="play" tone="primary" disabled={active} onClick={() => onStart(config)}>Start new crawl</Button></header>
     <section className="run-config panel">
       <div className="run-config__grid">
-        <Field label="Source URL"><input value={config.base_url || ""} onChange={(event) => update("base_url", event.target.value)} /></Field>
-        <Field label="Crawl mode"><select value={config.mode || "test"} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full catalog</option></select></Field>
-        <Field label="Product limit" hint="0 means no limit"><input type="number" min="0" disabled={config.mode === "full"} value={config.mode === "full" ? 0 : config.max_products ?? 5} onChange={(event) => update("max_products", Number(event.target.value))} /></Field>
-        <Field label="Concurrency"><input type="number" min="1" max="16" value={config.concurrency ?? 2} onChange={(event) => update("concurrency", Number(event.target.value))} /></Field>
-        <Field label="Download delay (seconds)"><input type="number" min="0.1" step="0.1" value={config.download_delay ?? 1} onChange={(event) => update("download_delay", Number(event.target.value))} /></Field>
-        <Field label="Request timeout"><input type="number" min="5" value={config.download_timeout ?? 45} onChange={(event) => update("download_timeout", Number(event.target.value))} /></Field>
+        <Field label="Source URL"><input disabled={active} value={displayedConfig.base_url || ""} onChange={(event) => update("base_url", event.target.value)} /></Field>
+        <Field label="Crawl mode"><select disabled={active} value={displayedConfig.mode || "test"} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full WooCommerce catalog</option></select></Field>
+        <Field label="Product limit" hint="0 means no limit"><input type="number" min="0" disabled={active || displayedConfig.mode === "full"} value={displayedConfig.mode === "full" ? 0 : displayedConfig.max_products ?? 5} onChange={(event) => update("max_products", Number(event.target.value))} /></Field>
+        <Field label="Concurrency"><input disabled={active} type="number" min="1" max="16" value={displayedConfig.concurrency ?? 2} onChange={(event) => update("concurrency", Number(event.target.value))} /></Field>
+        <Field label="Download delay (seconds)"><input disabled={active} type="number" min="0.1" step="0.1" value={displayedConfig.download_delay ?? 1} onChange={(event) => update("download_delay", Number(event.target.value))} /></Field>
+        <Field label="Request timeout"><input disabled={active} type="number" min="5" value={displayedConfig.download_timeout ?? 45} onChange={(event) => update("download_timeout", Number(event.target.value))} /></Field>
       </div>
       <div className="toggle-row">
-        {["obey_robots", "enrich_html", "download_media", "resume_checkpoint"].map((key) => <label key={key}><input type="checkbox" checked={Boolean(config[key])} onChange={(event) => update(key, event.target.checked)} /><span>{key.split("_").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ")}</span></label>)}
+        {["obey_robots", "enrich_html", "download_media", "resume_checkpoint"].map((key) => <label key={key}><input disabled={active} type="checkbox" checked={Boolean(displayedConfig[key])} onChange={(event) => update(key, event.target.checked)} /><span>{key.split("_").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ")}</span></label>)}
       </div>
+      {active ? <div className="security-notice"><Icon name="alert" /><span><strong>Showing the active run configuration.</strong> Stop or finish this crawl before preparing different settings.</span></div> : null}
     </section>
     <section className="catalog-discovery panel">
       <div className="panel-header catalog-discovery__header">
@@ -68,7 +70,7 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
         </div>
         <div className="category-picker" aria-label="Catalog categories">
           {(discovery.categories || []).map((category) => <label key={category.id}>
-            <input type="checkbox" checked={selectedIds.has(category.id)} onChange={() => toggleCategory(category.id)} />
+            <input type="checkbox" disabled={active} checked={selectedIds.has(category.id)} onChange={() => toggleCategory(category.id)} />
             <span><strong>{category.path || category.name}</strong><small>{formatNumber(category.count)} products</small></span>
           </label>)}
         </div>

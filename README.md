@@ -81,7 +81,7 @@ control panel.
 Render Free has an ephemeral filesystem and can stop an idle service. Keep the
 control page open while a crawl runs. The page polls live status as a normal
 user-facing operation, and S3 checkpoints preserve the normalized database every
-five products. On a restart or deploy, the service automatically restores the
+100 products by default. On a restart or deploy, the service automatically restores the
 latest S3 checkpoint before serving the admin API. If a crawl is active during a
 deploy, the service asks Scrapy to close cleanly so its final database is uploaded.
 
@@ -161,7 +161,8 @@ data:
 scrapy crawl catalog -a max_products=5 -a use_playwright=true
 ```
 
-Run the full catalog:
+Run the full WooCommerce catalog (this does not include the separately served
+2,500,000+ dynamic loose-diamond inventory feed):
 
 ```bash
 scrapy crawl catalog

@@ -71,3 +71,33 @@ def test_identical_diagnostics_are_written_once_per_run(tmp_path):
         (tmp_path / "diagnostics.jsonl").read_text(encoding="utf-8").splitlines()
     ) == 1
     _close_pipeline(pipeline)
+
+
+def test_resumed_run_rewrites_jsonl_from_database_without_duplicates(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("S3_BUCKET", raising=False)
+    product = {
+        "_record_type": "product",
+        "id": "99",
+        "name": "Adriana Ring",
+        "type": "simple",
+        "media": [],
+        "categories": [],
+        "attributes": [],
+        "variations": [],
+    }
+
+    first = _pipeline(tmp_path)
+    first.open_spider()
+    first.process_item(dict(product))
+    first.close_spider()
+
+    second = _pipeline(tmp_path)
+    second.open_spider()
+    second.process_item({**product, "name": "Adriana Ring Updated"})
+    second.close_spider()
+
+    rows = (tmp_path / "products.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert json.loads(rows[0])["name"] == "Adriana Ring Updated"

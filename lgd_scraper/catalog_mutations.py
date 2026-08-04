@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
-import shutil
 import sqlite3
+import tempfile
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -172,7 +173,53 @@ def write_normalized_csvs(
         ) as handle:
             writer = csv.writer(handle)
             writer.writerow([column[0] for column in cursor.description])
-            writer.writerows(cursor.fetchall())
+            writer.writerows(cursor)
+
+
+def write_jsonl_exports(connection: sqlite3.Connection, output_dir: Path) -> None:
+    """Rewrite nested exports from SQLite so resumed runs cannot duplicate rows."""
+
+    for filename, (table, order_by) in JSONL_EXPORTS.items():
+        target = output_dir / filename
+        temporary = target.with_name(f".{target.name}.tmp")
+        rows = connection.execute(
+            f"SELECT raw_json FROM {table} ORDER BY {order_by}"
+        )
+        with temporary.open("w", encoding="utf-8") as handle:
+            for (raw_json,) in rows:
+                handle.write(str(raw_json).rstrip("\n") + "\n")
+        temporary.replace(target)
+
+
+def build_catalog_archive(output_dir: Path) -> Path:
+    """Build an atomic archive outside its input tree to avoid self-inclusion."""
+
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / "catalog-export.zip"
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".catalog-export-",
+            suffix=".zip",
+            dir=output_dir.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        with zipfile.ZipFile(
+            temporary_path, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for path in sorted(output_dir.rglob("*")):
+                if not path.is_file() or path == target:
+                    continue
+                if path.name.endswith(("-wal", "-shm")):
+                    continue
+                archive.write(path, arcname=path.relative_to(output_dir))
+        temporary_path.replace(target)
+        return target
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def rebuild_catalog_artifacts(database_path: Path, output_dir: Path) -> dict[str, Any]:
@@ -182,13 +229,7 @@ def rebuild_catalog_artifacts(database_path: Path, output_dir: Path) -> dict[str
     connection = sqlite3.connect(database_path)
     try:
         write_normalized_csvs(connection, output_dir)
-        for filename, (table, order_by) in JSONL_EXPORTS.items():
-            rows = connection.execute(
-                f"SELECT raw_json FROM {table} ORDER BY {order_by}"
-            ).fetchall()
-            with (output_dir / filename).open("w", encoding="utf-8") as handle:
-                for (raw_json,) in rows:
-                    handle.write(str(raw_json).rstrip("\n") + "\n")
+        write_jsonl_exports(connection, output_dir)
 
         woocommerce_counts = export_woocommerce_csvs(connection, output_dir)
         database_counts = {
@@ -214,9 +255,7 @@ def rebuild_catalog_artifacts(database_path: Path, output_dir: Path) -> dict[str
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    archive = output_dir / "catalog-export.zip"
-    archive.unlink(missing_ok=True)
-    shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=output_dir)
+    build_catalog_archive(output_dir)
     return {
         "database_counts": database_counts,
         "woocommerce_export": woocommerce_counts,

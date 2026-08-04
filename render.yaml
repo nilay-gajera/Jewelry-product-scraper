@@ -19,7 +19,7 @@ services:
       - key: S3_MEDIA_ACL
         value: none
       - key: S3_UPLOAD_EVERY
-        value: "5"
+        value: "100"
       - key: S3_RESTORE_CHECKPOINT
         value: "1"
       - key: S3_SERVER_SIDE_ENCRYPTION

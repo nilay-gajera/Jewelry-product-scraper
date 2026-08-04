@@ -116,24 +116,58 @@ def list_admin_runs(limit: int = 50) -> list[dict[str, Any]]:
     return records
 
 
-def download_checkpoint(output_dir: Path) -> bool:
+def download_checkpoint(output_dir: Path, *, strict: bool = False) -> bool:
     """Restore the latest normalized database before a restarted free-tier run."""
 
     if not s3_enabled() or not _truthy(os.getenv("S3_RESTORE_CHECKPOINT", "1")):
         return False
     output_dir.mkdir(parents=True, exist_ok=True)
+    candidate: Path | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".catalog-checkpoint-",
+            suffix=".sqlite",
+            dir=output_dir,
+            delete=False,
+        ) as temporary:
+            candidate = Path(temporary.name)
         s3_client().download_file(
             os.environ["S3_BUCKET"],
             _key("checkpoints", "catalog.sqlite"),
-            str(output_dir / "catalog.sqlite"),
+            str(candidate),
         )
+        connection = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
+        try:
+            result = connection.execute("PRAGMA quick_check").fetchone()
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if not result or result[0] != "ok" or "products" not in tables:
+                raise sqlite3.DatabaseError("checkpoint is not a valid catalog database")
+        finally:
+            connection.close()
+
+        target = output_dir / "catalog.sqlite"
+        target.with_name(f"{target.name}-wal").unlink(missing_ok=True)
+        target.with_name(f"{target.name}-shm").unlink(missing_ok=True)
+        candidate.replace(target)
         return True
     except Exception as exc:
         error_code = getattr(exc, "response", {}).get("Error", {}).get("Code")
         if error_code not in {"404", "NoSuchKey", "NotFound"}:
             LOGGER.warning("Could not restore S3 checkpoint: %s", exc)
+            if strict:
+                raise RuntimeError(
+                    "The existing S3 catalog checkpoint could not be restored. "
+                    "The crawl was not started, to avoid overwriting recoverable data."
+                ) from exc
         return False
+    finally:
+        if candidate is not None:
+            candidate.unlink(missing_ok=True)
 
 
 def presigned_artifact_url(expires_in: int = 3600) -> str | None:
@@ -253,8 +287,12 @@ def delete_media_objects(local_paths: list[str]) -> int:
         )
         errors = response.get("Errors") or []
         if errors:
-            failed_keys = ", ".join(str(item.get("Key")) for item in errors[:5])
-            raise RuntimeError(f"S3 could not delete media objects: {failed_keys}")
+            failures = ", ".join(
+                f"{item.get('Code') or 'Error'}: "
+                f"{item.get('Message') or 'delete failed'} ({item.get('Key')})"
+                for item in errors[:5]
+            )
+            raise RuntimeError(f"S3 could not delete media objects: {failures}")
         deleted += len(batch)
     return deleted
 
@@ -270,7 +308,7 @@ class S3ArtifactPipeline:
         self.crawler = None
         self.output_dir = Path("outputs/catalog")
         self.bucket = os.getenv("S3_BUCKET")
-        self.upload_every = max(1, int(os.getenv("S3_UPLOAD_EVERY", "10")))
+        self.upload_every = max(1, int(os.getenv("S3_UPLOAD_EVERY", "100")))
         self.products_seen = 0
         self.last_error: str | None = None
 
