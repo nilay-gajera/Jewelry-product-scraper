@@ -274,6 +274,25 @@ class WooCommerceCatalogSpider(scrapy.Spider):
 
     def parse_product_page(self, response: Response, api_product: dict[str, Any] | None = None):
         product = dict(api_product or self._product_shell(response))
+        if response.status == 404 and api_product is not None:
+            # Some Store API diamond records publish a legacy detail permalink
+            # that no longer has an HTML route. The API record remains valid and
+            # complete enough to export, so treat HTML enrichment as optional.
+            product["html_enrichment"] = {
+                "status": "unavailable",
+                "http_status": 404,
+            }
+            if (
+                not self.authenticated
+                and product.get("type") == "variable"
+                and not product.get("variations")
+            ):
+                yield self._store_variation_request(product, page=1, variations=[])
+            elif product.get("variations"):
+                yield from self._finish_product(product)
+            else:
+                yield product
+            return
         if response.status != 200 or self._is_blocked(response):
             self._record_block(response)
             yield self._diagnostic_for_response(
@@ -1600,6 +1619,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             b"sucuri website firewall" in sample
             or b"access denied - sucuri" in sample
             or b"block id: geo02" in sample
+            or b"sucuri_cloudproxy_js" in sample
         )
 
     def _diagnostic_for_response(

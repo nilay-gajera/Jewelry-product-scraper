@@ -120,6 +120,7 @@ class CatalogWriterPipeline:
         self.connection: sqlite3.Connection | None = None
         self.handles: dict[str, Any] = {}
         self.counts: Counter[str] = Counter()
+        self.diagnostics_seen: set[tuple[Any, ...]] = set()
         self.crawler = None
         self.woocommerce_counts: dict[str, int] = {}
         self.progress_path = Path("outputs/catalog/progress.json")
@@ -137,8 +138,9 @@ class CatalogWriterPipeline:
         self.progress_path = self.output_dir / "progress.json"
 
         for record_type in ("products", "categories", "attributes", "diagnostics"):
+            mode = "w" if record_type == "diagnostics" else "a"
             self.handles[record_type] = (self.output_dir / f"{record_type}.jsonl").open(
-                "a", encoding="utf-8"
+                mode, encoding="utf-8"
             )
 
         self.connection = sqlite3.connect(self.output_dir / "catalog.sqlite")
@@ -234,10 +236,23 @@ class CatalogWriterPipeline:
             );
             """
         )
+        # Diagnostics describe the current run. Historical runs remain available
+        # in their immutable S3 archives and should not inflate the live counter.
+        self.connection.execute("DELETE FROM diagnostics")
         self.connection.commit()
 
     def process_item(self, item):
         record_type = item.get("_record_type", "product")
+        if record_type == "diagnostic":
+            key = (
+                item.get("kind"),
+                item.get("url"),
+                item.get("status"),
+                item.get("message"),
+            )
+            if key in self.diagnostics_seen:
+                return item
+            self.diagnostics_seen.add(key)
         self.counts[record_type] += 1
 
         if record_type == "product":

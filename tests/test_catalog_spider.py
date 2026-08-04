@@ -186,6 +186,42 @@ def test_sucuri_geo_block_detection():
     assert spider.access_blocked is True
 
 
+def test_sucuri_cookie_challenge_is_reported_as_blocked():
+    spider = WooCommerceCatalogSpider()
+    response = response_for(
+        "https://example.test/wp-json/wc/store/v1/products",
+        "<script>var sucuri_cloudproxy_js = 'challenge';</script>",
+        status=307,
+    )
+
+    assert spider._is_blocked(response)
+
+
+def test_api_product_survives_missing_optional_html_page_without_diagnostic():
+    spider = WooCommerceCatalogSpider()
+    api_product = {
+        "_record_type": "product",
+        "id": "800605728",
+        "name": "Round Cut Lab Diamond",
+        "type": "simple",
+        "source": "store",
+        "media": [{"source_url": "https://example.test/diamond.jpg"}],
+        "variations": [],
+    }
+    items = list(
+        spider.parse_product_page(
+            response_for(
+                "https://example.test/diamond/800605728/", "Not found", status=404
+            ),
+            api_product,
+        )
+    )
+
+    assert len(items) == 1
+    assert items[0]["_record_type"] == "product"
+    assert items[0]["html_enrichment"]["http_status"] == 404
+
+
 def test_variation_gallery_reads_store_extensions_and_preserves_attachment_ids():
     spider = WooCommerceCatalogSpider()
     variation = spider._normalize_variation(
