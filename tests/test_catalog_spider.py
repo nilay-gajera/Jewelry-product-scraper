@@ -222,6 +222,33 @@ def test_api_product_survives_missing_optional_html_page_without_diagnostic():
     assert items[0]["html_enrichment"]["http_status"] == 404
 
 
+def test_product_limit_is_enforced_for_resumed_detail_requests():
+    spider = WooCommerceCatalogSpider(max_products=2)
+    products = []
+
+    for product_id in ("1", "2", "3"):
+        products.extend(
+            spider.parse_product_page(
+                response_for(
+                    f"https://example.test/diamond/{product_id}/",
+                    "Not found",
+                    status=404,
+                ),
+                {
+                    "_record_type": "product",
+                    "id": product_id,
+                    "name": f"Diamond {product_id}",
+                    "type": "simple",
+                    "media": [],
+                    "variations": [],
+                },
+            )
+        )
+
+    assert [product["id"] for product in products] == ["1", "2"]
+    assert spider.products_emitted == 2
+
+
 def test_variation_gallery_reads_store_extensions_and_preserves_attachment_ids():
     spider = WooCommerceCatalogSpider()
     variation = spider._normalize_variation(

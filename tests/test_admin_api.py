@@ -246,6 +246,25 @@ def test_stale_stopping_state_recovers_as_stopped(tmp_path, monkeypatch):
     assert persisted["finished_at"]
 
 
+def test_finished_local_process_waits_for_watcher_terminal_state(
+    tmp_path, monkeypatch
+):
+    class FinishedProcess:
+        def poll(self):
+            return 0
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"state": "running", "run_id": "run-1"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(service, "STATUS_PATH", status_path)
+    monkeypatch.setattr(service, "process", FinishedProcess())
+
+    state = service._read_state()
+
+    assert state["state"] == "running"
+
+
 def test_forced_stop_kills_process_after_timeout():
     class FakeProcess:
         def __init__(self):

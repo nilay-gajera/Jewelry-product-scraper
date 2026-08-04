@@ -71,6 +71,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         self.allowed_domains = [urlparse(self.base_url).hostname or ""]
 
         self.products_scheduled = 0
+        self.products_emitted = 0
+        self.max_close_requested = False
         self.fallback_started = False
         self.second_sitemap_attempted = False
         self.access_blocked = False
@@ -182,7 +184,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             elif product.get("type") == "variable":
                 yield self._store_variation_request(product, page=1, variations=[])
             else:
-                yield product
+                yield from self._emit_product(product)
 
         yield from self._paginate(response, self.parse_products_api, payload)
 
@@ -291,7 +293,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             elif product.get("variations"):
                 yield from self._finish_product(product)
             else:
-                yield product
+                yield from self._emit_product(product)
             return
         if response.status != 200 or self._is_blocked(response):
             self._record_block(response)
@@ -309,7 +311,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             elif product.get("variations"):
                 yield from self._finish_product(product)
             else:
-                yield product
+                yield from self._emit_product(product)
             return
 
         product["source"] = (
@@ -411,7 +413,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         elif product.get("variations"):
             yield from self._finish_product(product)
         else:
-            yield product
+            yield from self._emit_product(product)
 
     def parse_categories_api(self, response: Response):
         payload = self._json_list(response)
@@ -1334,7 +1336,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         )
         if not attachment_ids:
             self._add_variation_media(product)
-            yield product
+            yield from self._emit_product(product)
             return
 
         chunks = [
@@ -1414,7 +1416,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
 
         self._apply_resolved_variation_galleries(product, resolved_media)
         self._add_variation_media(product)
-        yield product
+        yield from self._emit_product(product)
 
     def errback_variation_gallery_media(self, failure):
         request = failure.request
@@ -1439,7 +1441,27 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             return
         self._apply_resolved_variation_galleries(product, resolved_media)
         self._add_variation_media(product)
+        yield from self._emit_product(product)
+
+    def _emit_product(self, product: dict[str, Any]):
+        """Enforce the run limit at the final output boundary.
+
+        A resumed Scrapy JOBDIR can already contain product-detail requests from
+        a prior full crawl.  Limiting only newly scheduled API records therefore
+        allows a test run to exceed its configured size.  Every completed
+        product passes this gate, including restored requests.
+        """
+
+        if self.max_products and self.products_emitted >= self.max_products:
+            return
+        self.products_emitted += 1
         yield product
+        if self.max_products and self.products_emitted >= self.max_products:
+            crawler = getattr(self, "_crawler", None)
+            engine = getattr(crawler, "engine", None)
+            if engine is not None and not self.max_close_requested:
+                self.max_close_requested = True
+                engine.close_spider(self, "max_products")
 
     @staticmethod
     def _apply_resolved_variation_galleries(

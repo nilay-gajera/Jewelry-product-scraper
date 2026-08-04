@@ -199,11 +199,24 @@ def _read_state() -> dict[str, Any]:
     state = _read_json(STATUS_PATH)
     if not isinstance(state, dict):
         state = _default_state()
-    if state.get("state") == "running" and not _process_running():
+    # A local watcher still owns a process object after the child exits and may
+    # be packaging/uploading the final artifacts.  Leave the state alone during
+    # that short window so the watcher can publish the real terminal state.
+    # ``process is None`` identifies a genuinely stale state restored after a
+    # service restart, where no watcher exists to finish it.
+    if (
+        state.get("state") == "running"
+        and not _process_running()
+        and process is None
+    ):
         state["state"] = "interrupted"
         state["finished_at"] = state.get("finished_at") or _now()
         state["message"] = "The process stopped. Start again to resume from S3."
-    elif state.get("state") == "stopping" and not _process_running():
+    elif (
+        state.get("state") == "stopping"
+        and not _process_running()
+        and process is None
+    ):
         state["state"] = "stopped"
         state["finished_at"] = state.get("finished_at") or _now()
         state["message"] = "Crawl stopped. The latest completed checkpoint remains available."

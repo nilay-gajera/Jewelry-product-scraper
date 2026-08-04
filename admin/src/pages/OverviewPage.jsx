@@ -17,10 +17,11 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
   useEffect(() => setConfig(settings?.crawl || {}), [settings]);
 
   const catalog = status?.catalog || {};
-  const currentProducts = status?.progress?.records_seen?.product || status?.summary?.records_seen_this_run?.product || 0;
-  const limit = Number(config.max_products || 0);
-  const progress = limit ? Math.min(100, Math.round((currentProducts / limit) * 100)) : 0;
   const running = status?.state === "running" || status?.state === "stopping";
+  const activeConfig = running && status?.config ? status.config : config;
+  const currentProducts = status?.progress?.records_seen?.product ?? status?.summary?.records_seen_this_run?.product ?? 0;
+  const limit = activeConfig.mode === "full" ? 0 : Number(activeConfig.max_products || 0);
+  const progress = limit ? Math.min(100, Math.round((currentProducts / limit) * 100)) : 0;
   const logLines = useMemo(() => (logs || "").split("\n").filter(Boolean).slice(-7).reverse(), [logs]);
   const quality = catalog.quality || {};
 
@@ -41,10 +42,10 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
 
       <section className="control-band">
         <div className="control-grid">
-          <Field label="Source URL"><input value={config.base_url || ""} onChange={(event) => update("base_url", event.target.value)} /></Field>
-          <Field label="Product limit" hint="0 means full catalog"><input type="number" min="0" value={config.mode === "full" ? 0 : config.max_products ?? 5} disabled={config.mode === "full"} onChange={(event) => update("max_products", Number(event.target.value))} /></Field>
-          <Field label="Mode"><select value={config.mode || "test"} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full catalog</option></select></Field>
-          <Field label="Resume from checkpoint"><select value={config.resume_checkpoint ? "yes" : "no"} onChange={(event) => update("resume_checkpoint", event.target.value === "yes")}><option value="yes">Latest checkpoint</option><option value="no">Start fresh</option></select></Field>
+          <Field label="Source URL"><input value={activeConfig.base_url || ""} disabled={running} onChange={(event) => update("base_url", event.target.value)} /></Field>
+          <Field label="Product limit" hint="0 means full catalog"><input type="number" min="0" value={activeConfig.mode === "full" ? 0 : activeConfig.max_products ?? 5} disabled={running || activeConfig.mode === "full"} onChange={(event) => update("max_products", Number(event.target.value))} /></Field>
+          <Field label="Mode"><select value={activeConfig.mode || "test"} disabled={running} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full catalog</option></select></Field>
+          <Field label="Resume from checkpoint"><select value={activeConfig.resume_checkpoint ? "yes" : "no"} disabled={running} onChange={(event) => update("resume_checkpoint", event.target.value === "yes")}><option value="yes">Latest checkpoint</option><option value="no">Start fresh</option></select></Field>
           <div className="run-state"><StatusMark state={status?.state || "idle"} /><small>{status?.message || "Ready to start."}</small><small>{status?.started_at ? `Started ${formatDate(status.started_at)}` : "No active run"}</small></div>
         </div>
         <div className="progress-row">
