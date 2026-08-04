@@ -163,6 +163,40 @@ def delete_product(database_path: Path, product_id: str) -> dict[str, Any] | Non
     return deleted[0] if deleted else None
 
 
+def unreferenced_media_paths(
+    database_path: Path, candidate_paths: list[str]
+) -> list[str]:
+    """Return only media objects no remaining product references after deletion."""
+
+    normalized = list(
+        dict.fromkeys(str(path).strip() for path in candidate_paths if str(path).strip())
+    )
+    if not normalized:
+        return []
+    referenced: set[str] = set()
+    connection = sqlite3.connect(database_path)
+    try:
+        image_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(images)")
+        }
+        if "local_path" not in image_columns:
+            return normalized
+        for index in range(0, len(normalized), 500):
+            batch = normalized[index : index + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            referenced.update(
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT DISTINCT local_path FROM images "
+                    f"WHERE local_path IN ({placeholders})",
+                    batch,
+                ).fetchall()
+            )
+    finally:
+        connection.close()
+    return [path for path in normalized if path not in referenced]
+
+
 def write_normalized_csvs(
     connection: sqlite3.Connection, output_dir: Path
 ) -> None:

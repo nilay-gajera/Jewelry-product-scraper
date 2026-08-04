@@ -35,6 +35,7 @@ from lgd_scraper.catalog_mutations import (
     copy_database,
     delete_products,
     rebuild_catalog_artifacts,
+    unreferenced_media_paths,
 )
 from lgd_scraper.discovery import CatalogDiscoveryError, discover_catalog
 from lgd_scraper.s3sync import (
@@ -339,6 +340,7 @@ def _clear_local_catalog() -> None:
 
 
 def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
+    global process
     exit_code = current_process.wait()
     summary = _read_json(EXPORT_DIR / "crawl-summary.json")
     archive_error = None
@@ -355,6 +357,8 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
     with state_lock:
         state = _read_state()
         if state.get("run_id") != run_id:
+            if process is current_process:
+                process = None
             return
         requested_stop = state.get("state") in {"stopping", "stopped"}
         final_state = (
@@ -393,6 +397,8 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
         )
         _write_state(state)
         _persist_run(state)
+        if process is current_process:
+            process = None
 
 
 @app.get("/health")
@@ -646,7 +652,9 @@ def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, An
     )
     if delete_media:
         try:
-            media_deleted = delete_media_objects(media_paths)
+            media_deleted = delete_media_objects(
+                unreferenced_media_paths(DATABASE_PATH, media_paths)
+            )
         except Exception as exc:
             media_error = str(exc)
 

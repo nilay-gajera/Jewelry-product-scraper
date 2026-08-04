@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 from scrapy.http import HtmlResponse, Request
 
+from lgd_scraper.pipelines import CatalogMediaPipeline
 from lgd_scraper.spiders.catalog import WooCommerceCatalogSpider
 
 
@@ -47,6 +48,45 @@ def test_store_api_product_normalization_converts_minor_units():
     assert product["currency"] == "USD"
     assert product["type"] == "variable"
     assert product["media"][0]["source_url"].endswith("/ring.jpg")
+
+
+def test_loose_diamond_name_specs_become_attributes_without_dead_html_request():
+    spider = WooCommerceCatalogSpider(enrich_html=True)
+
+    product = spider._normalize_product(
+        {
+            "id": 2304165,
+            "name": "Asscher Cut 0.91 Carat D Color VVS2 Clarity Lab Grown Diamond",
+            "permalink": "https://example.test/product/legacy-diamond/",
+            "attributes": [],
+        },
+        "store",
+    )
+
+    assert product["product_family"] == "loose_diamond"
+    assert {
+        attribute["name"]: attribute["options"][0]
+        for attribute in product["attributes"]
+    } == {
+        "Shape": "Asscher",
+        "Carat": "0.91",
+        "Color": "D",
+        "Clarity": "VVS2",
+    }
+    assert product["html_enrichment"]["status"] == "skipped"
+    assert spider._should_enrich_product(product) is False
+
+
+def test_media_paths_are_shared_by_source_url_not_misleading_product_id():
+    source_url = "https://example.test/wp-content/uploads/asscher.png"
+    first = Request(source_url, meta={"catalog_product_id": "one"})
+    second = Request(source_url, meta={"catalog_product_id": "two"})
+
+    first_path = CatalogMediaPipeline.file_path(None, first)
+    second_path = CatalogMediaPipeline.file_path(None, second)
+
+    assert first_path == second_path
+    assert first_path.startswith("shared/")
 
 
 def test_selected_categories_are_sent_to_store_api_and_products_are_deduplicated():
@@ -253,8 +293,11 @@ def test_product_limit_is_enforced_for_resumed_detail_requests():
 def test_checkpoint_resume_skips_existing_ids_and_emits_only_new_products(tmp_path):
     database = tmp_path / "catalog.sqlite"
     connection = sqlite3.connect(database)
-    connection.execute("CREATE TABLE products (id TEXT PRIMARY KEY)")
-    connection.execute("INSERT INTO products VALUES ('42')")
+    connection.execute("CREATE TABLE products (id TEXT PRIMARY KEY, raw_json TEXT)")
+    connection.execute(
+        "INSERT INTO products VALUES ('42', ?)",
+        (json.dumps({"id": 42, "name": "Already stored", "attributes": []}),),
+    )
     connection.commit()
     connection.close()
     spider = WooCommerceCatalogSpider(
@@ -283,8 +326,45 @@ def test_checkpoint_resume_skips_existing_ids_and_emits_only_new_products(tmp_pa
     ]
 
     assert spider.existing_product_ids == {"42"}
+    assert spider.refresh_product_ids == set()
     assert [str(product["id"]) for product in products] == ["43"]
     assert spider.products_scheduled == 1
+
+
+def test_checkpoint_resume_refreshes_legacy_diamonds_once(tmp_path):
+    database = tmp_path / "catalog.sqlite"
+    name = "Asscher Cut 0.91 Carat D Color VVS2 Clarity Lab Grown Diamond"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE products (id TEXT PRIMARY KEY, raw_json TEXT)")
+    connection.execute(
+        "INSERT INTO products VALUES ('42', ?)",
+        (json.dumps({"id": 42, "name": name, "attributes": []}),),
+    )
+    connection.commit()
+    connection.close()
+    spider = WooCommerceCatalogSpider(
+        output_dir=str(tmp_path), resume_existing=True, enrich_html=True
+    )
+    request = Request(
+        "https://example.test/wp-json/wc/store/v1/products?per_page=100&page=1",
+        meta={"api_kind": "store", "page": 1},
+    )
+    response = HtmlResponse(
+        url=request.url,
+        body=json.dumps([{"id": 42, "name": name}]).encode(),
+        encoding="utf-8",
+        request=request,
+    )
+
+    products = [
+        item
+        for item in spider.parse_products_api(response)
+        if isinstance(item, dict) and item.get("_record_type") == "product"
+    ]
+
+    assert spider.refresh_product_ids == {"42"}
+    assert len(products) == 1
+    assert products[0]["attributes"][0]["name"] == "Shape"
 
 
 def test_product_limit_does_not_close_taxonomy_requests_early():

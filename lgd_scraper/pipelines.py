@@ -86,7 +86,6 @@ class CatalogMediaPipeline(FilesPipeline):
             )
 
     def file_path(self, request, response=None, info=None, *, item=None):
-        product_id = _safe_segment(request.meta.get("catalog_product_id"))
         parsed = urlparse(request.url)
         basename = _safe_segment(unquote(Path(parsed.path).name), "image")
         suffix = Path(basename).suffix.lower()
@@ -94,7 +93,7 @@ class CatalogMediaPipeline(FilesPipeline):
             suffix = ".bin"
         stem = _safe_segment(Path(basename).stem, "image")[:70]
         digest = hashlib.sha1(request.url.encode("utf-8")).hexdigest()[:12]
-        return f"products/{product_id}/{stem}-{digest}{suffix}"
+        return f"shared/{digest[:2]}/{stem}-{digest}{suffix}"
 
     def item_completed(self, results, item, info):
         by_url: dict[str, dict[str, Any]] = {}

@@ -119,7 +119,7 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
         <section className="product-list-panel">
           <div className="product-toolbar">
             <label className="search-control"><Icon name="search" /><input placeholder="Search by name, SKU, or source ID…" value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); setSelectedIds(new Set()); }} /></label>
-            <label className="select-control"><Icon name="filter" /><select value={type} onChange={(event) => { setType(event.target.value); setPage(1); setSelectedIds(new Set()); }}><option value="">All types</option><option value="simple">Simple</option><option value="variable">Variable</option><option value="variation">Variation</option></select></label>
+            <label className="select-control"><Icon name="filter" /><select value={type} onChange={(event) => { setType(event.target.value); setPage(1); setSelectedIds(new Set()); }}><option value="">All types</option><option value="simple">Simple</option><option value="variable">Variable</option></select></label>
             {selectedIds.size && !crawlActive ? <div className="product-toolbar__bulk"><span><strong>{selectedIds.size}</strong> product{selectedIds.size === 1 ? "" : "s"} selected</span><button onClick={() => setSelectedIds(new Set())}>Clear selection</button><Button icon="trash" tone="danger" onClick={() => setConfirmingBulkDelete(true)}>Delete selected</Button></div> : null}
           </div>
           {crawlActive ? <div className="security-notice"><Icon name="alert" /><span><strong>Catalog crawl in progress.</strong> Product deletion and selection are disabled until the checkpoint is closed safely.</span></div> : null}

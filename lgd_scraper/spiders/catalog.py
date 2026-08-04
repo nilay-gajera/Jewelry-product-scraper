@@ -37,6 +37,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         "HTTPERROR_ALLOW_ALL": True,
     }
 
+    DIAMOND_NAME_RE = re.compile(
+        r"^(?P<shape>.+?)\s+Cut\s+(?P<carat>\d+(?:\.\d+)?)\s+Carat\s+"
+        r"(?P<color>[A-Z]+)\s+Color\s+(?P<clarity>[A-Z0-9]+)\s+Clarity\s+"
+        r"Lab\s+Grown\s+Diamond$",
+        re.IGNORECASE,
+    )
+
     def __init__(
         self,
         base_url: str = "https://www.loosegrowndiamond.com/",
@@ -73,7 +80,10 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         )
         self.allowed_domains = [urlparse(self.base_url).hostname or ""]
         self.resume_existing = _truthy(resume_existing)
-        self.existing_product_ids = self._load_existing_product_ids()
+        (
+            self.existing_product_ids,
+            self.refresh_product_ids,
+        ) = self._load_existing_product_ids()
 
         self.products_scheduled = 0
         self.products_emitted = 0
@@ -93,26 +103,42 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         for request in self.start_requests():
             yield request
 
-    def _load_existing_product_ids(self) -> set[str]:
+    def _load_existing_product_ids(self) -> tuple[set[str], set[str]]:
         if not self.resume_existing:
-            return set()
+            return set(), set()
         database_path = Path(self.output_dir).resolve() / "catalog.sqlite"
         if not database_path.exists():
-            return set()
+            return set(), set()
         try:
             connection = sqlite3.connect(
                 f"file:{database_path}?mode=ro", uri=True, timeout=5
             )
             try:
-                return {
-                    str(row[0])
-                    for row in connection.execute("SELECT id FROM products").fetchall()
-                }
+                existing: set[str] = set()
+                refresh: set[str] = set()
+                for product_id, raw_json in connection.execute(
+                    "SELECT id, raw_json FROM products"
+                ):
+                    normalized_id = str(product_id)
+                    existing.add(normalized_id)
+                    try:
+                        product = json.loads(raw_json)
+                    except (json.JSONDecodeError, TypeError):
+                        refresh.add(normalized_id)
+                        continue
+                    if (
+                        not product.get("attributes")
+                        and self.DIAMOND_NAME_RE.match(
+                            str(product.get("name") or "").strip()
+                        )
+                    ):
+                        refresh.add(normalized_id)
+                return existing, refresh
             finally:
                 connection.close()
         except sqlite3.Error as exc:
             self.logger.warning("Could not read resumed product IDs: %s", exc)
-            return set()
+            return set(), set()
 
     def start_requests(self):
         if self.authenticated:
@@ -182,7 +208,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             if self.max_products and self.products_scheduled >= self.max_products:
                 break
             product_id = str(raw_product.get("id") or "")
-            if product_id and product_id in self.existing_product_ids:
+            if (
+                product_id
+                and product_id in self.existing_product_ids
+                and product_id not in self.refresh_product_ids
+            ):
                 continue
             if product_id and product_id in self.seen_product_ids:
                 continue
@@ -206,7 +236,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                         "variations": [],
                     },
                 )
-            elif self.enrich_html and product.get("url"):
+            elif self._should_enrich_product(product):
                 yield self._page_request(product["url"], product)
             elif product.get("type") == "variable":
                 yield self._store_variation_request(product, page=1, variations=[])
@@ -225,7 +255,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 "variations_api_unavailable",
                 f"Variations API failed for product {product.get('id')}.",
             )
-            if self.enrich_html and product.get("url"):
+            if self._should_enrich_product(product):
                 yield self._page_request(product["url"], product)
             else:
                 self._promote_structured_variations(product, accumulated)
@@ -256,7 +286,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             return
 
         product["variations"] = accumulated
-        if self.enrich_html and product.get("url"):
+        if self._should_enrich_product(product):
             yield self._page_request(product["url"], product)
         else:
             self._promote_structured_variations(product, accumulated)
@@ -689,6 +719,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "meta_data": raw.get("meta_data") or [],
             "raw_api": raw,
         }
+        self._infer_diamond_attributes(product)
         for position, image in enumerate(images):
             url = (
                 image.get("src")
@@ -710,6 +741,44 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 }
             )
         return product
+
+    def _infer_diamond_attributes(self, product: dict[str, Any]) -> None:
+        """Preserve diamond specs encoded by the source in otherwise-empty names."""
+
+        if product.get("attributes"):
+            return
+        match = self.DIAMOND_NAME_RE.match(str(product.get("name") or "").strip())
+        if not match:
+            return
+        values = {
+            "Shape": match.group("shape").strip().title(),
+            "Carat": match.group("carat"),
+            "Color": match.group("color").upper(),
+            "Clarity": match.group("clarity").upper(),
+        }
+        product["product_family"] = "loose_diamond"
+        product["attributes"] = [
+            {
+                "id": f"inferred_{name.lower()}",
+                "name": name,
+                "visible": True,
+                "variation": False,
+                "options": [value],
+                "source": "inferred_from_product_name",
+            }
+            for name, value in values.items()
+        ]
+        product["html_enrichment"] = {
+            "status": "skipped",
+            "reason": "store_api_loose_diamond_record",
+        }
+
+    def _should_enrich_product(self, product: dict[str, Any]) -> bool:
+        return bool(
+            self.enrich_html
+            and product.get("url")
+            and product.get("product_family") != "loose_diamond"
+        )
 
     def _normalize_variation(
         self, raw: dict[str, Any], product_name: str, source: str
@@ -1487,7 +1556,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             or product.get("url")
             or ""
         )
-        if product_id and product_id in self.existing_product_ids:
+        if (
+            product_id
+            and product_id in self.existing_product_ids
+            and product_id not in self.refresh_product_ids
+        ):
             return
         self.products_emitted += 1
         yield product

@@ -370,6 +370,7 @@ def test_process_watcher_records_requested_stop(tmp_path, monkeypatch):
     state = json.loads(status_path.read_text(encoding="utf-8"))
     assert state["state"] == "stopped"
     assert state["exit_code"] == -15
+    assert service.process is None
 
 
 def test_process_watcher_finishes_with_warning_when_local_archive_fails(
@@ -539,6 +540,57 @@ def test_failed_artifact_rebuild_reports_warning_after_durable_delete(
     assert result["catalog"]["products"] == 0
     assert latest_calls == []
     assert catalog_summary(database)["products"] == 0
+
+
+def test_deleting_product_keeps_s3_media_still_referenced_by_another_product(
+    tmp_path, monkeypatch
+):
+    export = tmp_path / "export"
+    export.mkdir()
+    database = export / "catalog.sqlite"
+    _catalog(database)
+    _add_product(database)
+    connection = sqlite3.connect(database)
+    connection.execute("ALTER TABLE images ADD COLUMN local_path TEXT")
+    connection.execute(
+        "UPDATE images SET local_path = 'shared/shape.jpg'"
+    )
+    for product_id in ("99", "100"):
+        raw_json = connection.execute(
+            "SELECT raw_json FROM products WHERE id = ?", (product_id,)
+        ).fetchone()[0]
+        product = json.loads(raw_json)
+        for media in product["media"]:
+            media["local_path"] = "shared/shape.jpg"
+        connection.execute(
+            "UPDATE products SET raw_json = ? WHERE id = ?",
+            (json.dumps(product), product_id),
+        )
+    connection.commit()
+    connection.close()
+    deleted_media = []
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+    monkeypatch.setattr(service, "process", None)
+    monkeypatch.setattr(service, "upload_database_checkpoint", lambda path: True)
+    monkeypatch.setattr(
+        service,
+        "rebuild_catalog_artifacts",
+        lambda *args: {"database_counts": {"products": 1}},
+    )
+    monkeypatch.setattr(service, "upload_latest_artifacts", lambda *args: True)
+    monkeypatch.setattr(
+        service,
+        "delete_media_objects",
+        lambda paths: deleted_media.extend(paths) or len(paths),
+    )
+
+    result = service.remove_product("99", delete_media=True)
+
+    assert result["deleted"] is True
+    assert result["media_deleted"] == 0
+    assert deleted_media == []
+    assert catalog_summary(database)["products"] == 1
 
 
 def test_delete_candidate_uses_database_filesystem(tmp_path, monkeypatch):
