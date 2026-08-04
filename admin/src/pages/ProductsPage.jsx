@@ -63,24 +63,26 @@ function ProductInspector({ product, onClose }) {
   const [selectedVariation, setSelectedVariation] = useState("");
   useEffect(() => { setTab("overview"); setSelectedVariation(product?.variations?.[0]?.id || ""); }, [product?.id]);
   const media = product?.media || [];
-  const featured = media.find((item) => item.role === "featured") || media[0];
+  const productMedia = useMemo(() => uniqueMediaByUrl(media), [media]);
   const variations = product?.variations || [];
   const variation = variations.find((item) => String(item.id) === String(selectedVariation)) || variations[0];
   const variationMedia = useMemo(() => {
     if (!variation) return [];
-    return media.filter((item) => String(item.variation_id || "") === String(variation.id));
+    return uniqueMediaByUrl(media.filter((item) => String(item.variation_id || "") === String(variation.id)));
   }, [media, variation]);
+  const activeMedia = tab === "variations" && variationMedia.length ? variationMedia : productMedia;
+  const featured = activeMedia.find((item) => item.role === "variation") || activeMedia.find((item) => item.role === "featured") || activeMedia[0];
 
   return (
     <aside className="product-inspector">
       <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></header>
       {!product ? <LoadingLine /> : <>
         <div className="inspector-hero">{featured ? <img src={featured.display_url || featured.source_url} alt={featured.alt || product.name || "Product"} /> : <span><Icon name="image" size={38} /></span>}</div>
-        <div className="media-rail">{media.slice(0, 8).map((item, index) => <img key={`${item.source_url}-${index}`} src={item.display_url || item.source_url} alt={item.alt || ""} loading="lazy" />)}{media.length > 8 ? <span>+{media.length - 8}</span> : null}</div>
+        <div className="media-rail">{activeMedia.slice(0, 8).map((item) => <img key={item.source_url} src={item.display_url || item.source_url} alt={item.alt || ""} loading="lazy" />)}{activeMedia.length > 8 ? <span>+{activeMedia.length - 8}</span> : null}</div>
         <nav className="tabs" aria-label="Product detail tabs">{["overview", "variations", "media", "raw"].map((name) => <button key={name} className={tab === name ? "selected" : ""} onClick={() => setTab(name)}>{name === "raw" ? "Raw data" : name[0].toUpperCase() + name.slice(1)}</button>)}</nav>
         {tab === "overview" ? <Overview product={product} /> : null}
         {tab === "variations" ? <Variations variations={variations} selected={variation} onSelect={setSelectedVariation} media={variationMedia} /> : null}
-        {tab === "media" ? <MediaGrid media={media} /> : null}
+        {tab === "media" ? <MediaGrid media={productMedia} /> : null}
         {tab === "raw" ? <pre className="raw-data">{JSON.stringify(product, null, 2)}</pre> : null}
       </>}
     </aside>
@@ -111,4 +113,14 @@ function Variations({ variations, selected, onSelect, media }) {
 
 function MediaGrid({ media }) {
   return media.length ? <div className="media-grid">{media.map((item, index) => <figure key={`${item.source_url}-${index}`}><img src={item.display_url || item.source_url} alt={item.alt || ""} loading="lazy" /><figcaption>{item.role}{item.variation_id ? ` · variation ${item.variation_id}` : ""}</figcaption></figure>)}</div> : <EmptyState icon="image" title="No media captured" body="Product and variation images appear here after a successful media run." />;
+}
+
+function uniqueMediaByUrl(media) {
+  const seen = new Set();
+  return media.filter((item) => {
+    const url = item.source_url || item.local_path || item.display_url;
+    if (!url || seen.has(url)) return false;
+    seen.add(url);
+    return true;
+  });
 }

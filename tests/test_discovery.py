@@ -7,6 +7,14 @@ from lgd_scraper.discovery import discover_catalog
 
 def test_discovery_counts_catalog_and_builds_category_paths():
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(
+                200,
+                text=(
+                    "Explore our collection of 2,500,000+ IGI, GIA, GCAL "
+                    "certified lab diamonds"
+                ),
+            )
         if request.url.path.endswith("/products/categories"):
             return httpx.Response(
                 200,
@@ -29,6 +37,9 @@ def test_discovery_counts_catalog_and_builds_category_paths():
     client.close()
 
     assert result["total_products"] == 347
+    assert result["woocommerce_products"] == 347
+    assert result["advertised_diamond_inventory"] == 2_500_000
+    assert result["advertised_diamond_inventory_label"] == "2,500,000+"
     assert result["total_categories"] == 2
     assert result["categories"][1]["path"] == "Rings / Solitaire"
     assert result["categories"][1]["count"] == 48

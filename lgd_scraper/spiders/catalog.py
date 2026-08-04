@@ -200,8 +200,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 yield self._page_request(product["url"], product)
             else:
                 self._promote_structured_variations(product, accumulated)
-                self._add_variation_media(product)
-                yield product
+                yield from self._finish_product(product)
             return
 
         accumulated.extend(
@@ -228,12 +227,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             return
 
         product["variations"] = accumulated
-        self._add_variation_media(product)
         if self.enrich_html and product.get("url"):
             yield self._page_request(product["url"], product)
         else:
             self._promote_structured_variations(product, accumulated)
-            yield product
+            yield from self._finish_product(product)
 
     def parse_store_variations(self, response: Response):
         product = response.meta["product"]
@@ -246,8 +244,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 f"Public variation lookup failed for product {product.get('id')}.",
             )
             self._promote_structured_variations(product, accumulated)
-            self._add_variation_media(product)
-            yield product
+            yield from self._finish_product(product)
             return
 
         accumulated.extend(
@@ -261,8 +258,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             return
 
         self._promote_structured_variations(product, accumulated)
-        self._add_variation_media(product)
-        yield product
+        yield from self._finish_product(product)
 
     @staticmethod
     def _promote_structured_variations(
@@ -291,6 +287,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 and not product.get("variations")
             ):
                 yield self._store_variation_request(product, page=1, variations=[])
+            elif product.get("variations"):
+                yield from self._finish_product(product)
             else:
                 yield product
             return
@@ -373,7 +371,6 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                     self._normalize_variation(item, product["name"], "html")
                     for item in variations
                 ]
-                self._add_variation_media(product)
 
         if (
             self.authenticated
@@ -383,7 +380,6 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         ):
             product["variations"] = product["structured_variations"]
             product["variation_source_fallback"] = "json_ld"
-            self._add_variation_media(product)
 
         product["media"] = self._dedupe_media(product.get("media", []))
 
@@ -393,6 +389,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             and not product.get("variations")
         ):
             yield self._store_variation_request(product, page=1, variations=[])
+        elif product.get("variations"):
+            yield from self._finish_product(product)
         else:
             yield product
 
@@ -780,14 +778,20 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                     collect(url)
                     url = None
                 if isinstance(url, str) and url:
-                    images.append(
-                        {
-                            "source_url": url,
-                            "alt": value.get("alt"),
-                            "width": value.get("width"),
-                            "height": value.get("height"),
-                        }
+                    image_item = {
+                        "source_url": url,
+                        "alt": value.get("alt"),
+                        "width": value.get("width"),
+                        "height": value.get("height"),
+                    }
+                    attachment_id = (
+                        value.get("attachment_id")
+                        or value.get("image_id")
+                        or value.get("id")
                     )
+                    if str(attachment_id or "").isdigit():
+                        image_item["attachment_id"] = str(attachment_id)
+                    images.append(image_item)
                 else:
                     for nested in value.values():
                         collect(nested)
@@ -1290,20 +1294,185 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 )
         product["media"] = self._dedupe_media(media)
 
+    def _finish_product(self, product: dict[str, Any]):
+        """Resolve attachment-only galleries, then emit one complete product."""
+
+        known_media = {
+            str(item.get("attachment_id")): dict(item)
+            for variation in product.get("variations") or []
+            for item in variation.get("gallery") or []
+            if item.get("attachment_id")
+        }
+        self._apply_resolved_variation_galleries(product, known_media)
+        attachment_ids = list(
+            dict.fromkeys(
+                str(attachment_id)
+                for variation in product.get("variations") or []
+                for attachment_id in variation.get("gallery_image_ids") or []
+                if str(attachment_id).isdigit()
+                and str(attachment_id) not in known_media
+            )
+        )
+        if not attachment_ids:
+            self._add_variation_media(product)
+            yield product
+            return
+
+        chunks = [
+            attachment_ids[index : index + 100]
+            for index in range(0, len(attachment_ids), 100)
+        ]
+        yield self._variation_gallery_media_request(
+            product, chunks[0], chunks[1:], {}
+        )
+
+    def _variation_gallery_media_request(
+        self,
+        product: dict[str, Any],
+        attachment_ids: list[str],
+        remaining_chunks: list[list[str]],
+        resolved_media: dict[str, dict[str, Any]],
+    ) -> Request:
+        return self._api_request(
+            self._url(
+                "wp-json/wp/v2/media",
+                include=",".join(attachment_ids),
+                per_page=100,
+                orderby="include",
+            ),
+            self.parse_variation_gallery_media,
+            meta={
+                "api_kind": "wp_media",
+                "request_kind": "variation_gallery_media",
+                "product": product,
+                "remaining_chunks": remaining_chunks,
+                "resolved_media": resolved_media,
+            },
+            errback=self.errback_variation_gallery_media,
+            include_authorization=False,
+        )
+
+    def parse_variation_gallery_media(self, response: Response):
+        product = response.meta["product"]
+        remaining_chunks = list(response.meta.get("remaining_chunks") or [])
+        resolved_media = dict(response.meta.get("resolved_media") or {})
+        payload = self._json_list(response)
+        if payload is None:
+            yield self._diagnostic_for_response(
+                response,
+                "variation_gallery_media_unavailable",
+                f"Variation gallery attachments could not be resolved for product {product.get('id')}.",
+            )
+        else:
+            for raw_media in payload:
+                attachment_id = str(raw_media.get("id") or "")
+                media_details = raw_media.get("media_details") or {}
+                sizes = media_details.get("sizes") or {}
+                full_size = sizes.get("full") or {}
+                guid = raw_media.get("guid") or {}
+                source_url = (
+                    raw_media.get("source_url")
+                    or full_size.get("source_url")
+                    or (guid.get("rendered") if isinstance(guid, dict) else None)
+                )
+                if attachment_id and source_url:
+                    resolved_media[attachment_id] = {
+                        "attachment_id": attachment_id,
+                        "source_url": source_url,
+                        "alt": raw_media.get("alt_text"),
+                        "width": media_details.get("width") or full_size.get("width"),
+                        "height": media_details.get("height") or full_size.get("height"),
+                    }
+
+        if remaining_chunks:
+            yield self._variation_gallery_media_request(
+                product,
+                remaining_chunks[0],
+                remaining_chunks[1:],
+                resolved_media,
+            )
+            return
+
+        self._apply_resolved_variation_galleries(product, resolved_media)
+        self._add_variation_media(product)
+        yield product
+
+    def errback_variation_gallery_media(self, failure):
+        request = failure.request
+        product = request.meta["product"]
+        remaining_chunks = list(request.meta.get("remaining_chunks") or [])
+        resolved_media = dict(request.meta.get("resolved_media") or {})
+        yield {
+            "_record_type": "diagnostic",
+            "kind": "variation_gallery_media_failed",
+            "url": request.url,
+            "status": None,
+            "message": str(failure.value),
+            "request_kind": "variation_gallery_media",
+        }
+        if remaining_chunks:
+            yield self._variation_gallery_media_request(
+                product,
+                remaining_chunks[0],
+                remaining_chunks[1:],
+                resolved_media,
+            )
+            return
+        self._apply_resolved_variation_galleries(product, resolved_media)
+        self._add_variation_media(product)
+        yield product
+
+    @staticmethod
+    def _apply_resolved_variation_galleries(
+        product: dict[str, Any], resolved_media: dict[str, dict[str, Any]]
+    ) -> None:
+        for variation in product.get("variations") or []:
+            gallery = list(variation.get("gallery") or [])
+            existing_urls = {
+                str(item.get("source_url")) for item in gallery if item.get("source_url")
+            }
+            featured_url = str(variation.get("image_url") or "")
+            for attachment_id in variation.get("gallery_image_ids") or []:
+                resolved = resolved_media.get(str(attachment_id))
+                if not resolved:
+                    continue
+                source_url = str(resolved.get("source_url") or "")
+                if not source_url or source_url == featured_url or source_url in existing_urls:
+                    continue
+                gallery.append({**resolved, "position": len(gallery)})
+                existing_urls.add(source_url)
+            variation["gallery"] = gallery
+
     @staticmethod
     def _dedupe_media(media: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+        role_priority = {
+            "featured": 0,
+            "variation": 0,
+            "gallery": 1,
+            "variation_gallery": 1,
+            "json_ld": 2,
+        }
+        unique: dict[tuple[str, str], dict[str, Any]] = {}
         for item in media:
-            url = item.get("source_url")
+            url = str(item.get("source_url") or "")
             if not url:
                 continue
-            key = (
-                item.get("variation_id") or "",
-                item.get("role") or "gallery",
-                item.get("position", 0),
-                url,
-            )
-            unique[key] = item
+            key = (str(item.get("variation_id") or ""), url)
+            existing = unique.get(key)
+            if existing is None:
+                unique[key] = dict(item)
+                continue
+            existing_role = str(existing.get("role") or "gallery")
+            incoming_role = str(item.get("role") or "gallery")
+            if role_priority.get(incoming_role, 10) < role_priority.get(existing_role, 10):
+                replacement = dict(item)
+                for field in ("alt", "width", "height", "local_path", "checksum"):
+                    replacement[field] = replacement.get(field) or existing.get(field)
+                unique[key] = replacement
+            else:
+                for field in ("alt", "width", "height", "local_path", "checksum"):
+                    if not existing.get(field) and item.get(field):
+                        existing[field] = item[field]
         return list(unique.values())
 
     def _page_request(
@@ -1349,9 +1518,16 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             },
         )
 
-    def _api_request(self, url: str, callback, meta: dict[str, Any]) -> Request:
+    def _api_request(
+        self,
+        url: str,
+        callback,
+        meta: dict[str, Any],
+        errback=None,
+        include_authorization: bool = True,
+    ) -> Request:
         headers = {"Accept": "application/json"}
-        if self.authorization:
+        if self.authorization and include_authorization:
             headers["Authorization"] = self.authorization
         meta = {**meta, "request_kind": meta.get("request_kind", "api")}
         return Request(
@@ -1359,7 +1535,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             callback=callback,
             headers=headers,
             meta=meta,
-            errback=self.errback_request,
+            errback=errback or self.errback_request,
             dont_filter=True,
         )
 

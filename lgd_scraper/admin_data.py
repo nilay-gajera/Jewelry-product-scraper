@@ -265,6 +265,17 @@ def list_products(
         for row in rows:
             product = _json(row["raw_json"], {})
             media = product.get("media") or []
+            unique_media_count = len(
+                {
+                    item.get("source_url")
+                    for item in media
+                    if item.get("source_url")
+                }
+            )
+            featured = next(
+                (item for item in media if item.get("role") == "featured"),
+                media[0] if media else None,
+            )
             items.append(
                 {
                     "id": row["id"],
@@ -274,9 +285,9 @@ def list_products(
                     "price": row["price"],
                     "stock_status": row["stock_status"],
                     "source": row["source"],
-                    "thumbnail": public_media_url(media[0]) if media else "",
+                    "thumbnail": public_media_url(featured) if featured else "",
                     "variation_count": len(product.get("variations") or []),
-                    "image_count": len(media),
+                    "image_count": unique_media_count,
                     "category_count": len(product.get("categories") or []),
                     "categories": [
                         item.get("name") for item in product.get("categories") or []

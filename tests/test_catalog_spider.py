@@ -219,6 +219,7 @@ def test_variation_gallery_reads_store_extensions_and_preserves_attachment_ids()
             "alt": None,
             "width": None,
             "height": None,
+            "attachment_id": "901",
             "position": 0,
         }
     ]
@@ -230,6 +231,91 @@ def test_variation_gallery_reads_store_extensions_and_preserves_attachment_ids()
         "905",
         "906",
     ]
+
+
+def test_media_deduplication_prefers_semantic_roles_and_keeps_variation_links():
+    spider = WooCommerceCatalogSpider()
+    source_url = "https://example.test/ring.jpg"
+
+    media = spider._dedupe_media(
+        [
+            {"role": "gallery", "position": 0, "source_url": source_url},
+            {"role": "json_ld", "position": 0, "source_url": source_url},
+            {"role": "featured", "position": 0, "source_url": source_url},
+            {
+                "role": "variation",
+                "variation_id": 501,
+                "source_url": source_url,
+            },
+            {
+                "role": "variation",
+                "variation_id": 502,
+                "source_url": source_url,
+            },
+        ]
+    )
+
+    assert len(media) == 3
+    assert media[0]["role"] == "featured"
+    assert {item.get("variation_id") for item in media[1:]} == {501, 502}
+
+
+def test_attachment_ids_are_resolved_into_each_variation_gallery():
+    spider = WooCommerceCatalogSpider(base_url="https://example.test/")
+    product = {
+        "_record_type": "product",
+        "id": "99",
+        "name": "Adriana Ring",
+        "media": [],
+        "variations": [
+            {
+                "id": 501,
+                "image_url": "https://example.test/front.jpg",
+                "gallery": [],
+                "gallery_image_ids": ["901", "902"],
+            }
+        ],
+    }
+
+    pending = list(spider._finish_product(product))
+    assert len(pending) == 1
+    media_request = pending[0]
+    assert isinstance(media_request, Request)
+    assert "wp-json/wp/v2/media" in media_request.url
+
+    response = HtmlResponse(
+        url=media_request.url,
+        body=json.dumps(
+            [
+                {
+                    "id": 901,
+                    "source_url": "https://example.test/side.jpg",
+                    "alt_text": "Side view",
+                    "media_details": {"width": 1200, "height": 1200},
+                },
+                {
+                    "id": 902,
+                    "source_url": "https://example.test/hand.jpg",
+                    "alt_text": "On hand",
+                    "media_details": {"width": 1200, "height": 1200},
+                },
+            ]
+        ).encode(),
+        encoding="utf-8",
+        request=media_request,
+    )
+    completed = list(spider.parse_variation_gallery_media(response))
+    completed_product = next(item for item in completed if isinstance(item, dict))
+
+    assert [
+        item["source_url"] for item in completed_product["variations"][0]["gallery"]
+    ] == [
+        "https://example.test/side.jpg",
+        "https://example.test/hand.jpg",
+    ]
+    assert sum(
+        item["role"] == "variation_gallery" for item in completed_product["media"]
+    ) == 2
 
 
 def test_json_ld_product_group_is_preserved_as_variation_fallback():

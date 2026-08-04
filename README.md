@@ -4,7 +4,7 @@ This project exports the public or authorized WooCommerce catalog at
 `loosegrowndiamond.com`, including:
 
 - Parent products and product metadata
-- Product images plus resolved variation gallery URLs and unresolved attachment IDs
+- Product images plus per-variation galleries resolved from URLs and WordPress attachment IDs
 - Variation names, IDs, SKUs, prices, stock, and attribute combinations
 - Descriptions, short descriptions, SEO metadata, tags, brands, dimensions, and stock fields
 - Product attributes, global attribute terms, categories, and category hierarchy
@@ -81,8 +81,9 @@ control panel.
 Render Free has an ephemeral filesystem and can stop an idle service. Keep the
 control page open while a crawl runs. The page polls live status as a normal
 user-facing operation, and S3 checkpoints preserve the normalized database every
-ten products. If Render restarts, press **Start crawl** again; the service restores
-the latest S3 checkpoint and safely upserts records.
+five products. On a restart or deploy, the service automatically restores the
+latest S3 checkpoint before serving the admin API. If a crawl is active during a
+deploy, the service asks Scrapy to close cleanly so its final database is uploaded.
 
 The Render container deliberately uses static HTTP/API extraction and does not
 install a Playwright browser, which keeps memory usage suitable for the Free
@@ -117,10 +118,12 @@ temporary signed S3 URLs for downloaded media.
 
 ### Count first and crawl selected categories
 
-In **Crawl runs**, choose **Count full catalog**. This reads WooCommerce's total
-product header and category counts without downloading product pages or images.
-Select one or more categories and then start the crawl. Products assigned to
-overlapping selected categories are de-duplicated automatically.
+In **Crawl runs**, choose **Refresh inventory counts**. The dashboard reports
+WooCommerce products separately from the storefront's advertised loose-diamond
+inventory. Category selection applies to WooCommerce jewelry products; the
+millions of loose diamonds are served by a separate dynamic inventory system.
+Select one or more WooCommerce categories and then start the crawl. Products
+assigned to overlapping selected categories are de-duplicated automatically.
 
 The equivalent command-line filter is:
 

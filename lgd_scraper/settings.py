@@ -48,9 +48,10 @@ DEFAULT_REQUEST_HEADERS = {
 }
 
 ITEM_PIPELINES = {
-    "lgd_scraper.s3sync.S3ArtifactPipeline": 50,
     "lgd_scraper.pipelines.CatalogMediaPipeline": 100,
     "lgd_scraper.pipelines.CatalogWriterPipeline": 300,
+    # Upload only after the writer has committed the current product.
+    "lgd_scraper.s3sync.S3ArtifactPipeline": 400,
 }
 CATALOG_DOWNLOAD_MEDIA = os.getenv("SCRAPER_DOWNLOAD_MEDIA", "1").strip().lower() in {
     "1",

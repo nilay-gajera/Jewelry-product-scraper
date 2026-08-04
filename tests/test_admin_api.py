@@ -53,7 +53,12 @@ def _catalog(path):
                 "role": "featured",
                 "source_url": "https://source.test/ring.jpg",
                 "local_path": "products/99/ring.jpg",
-            }
+            },
+            {
+                "role": "json_ld",
+                "source_url": "https://source.test/ring.jpg",
+                "local_path": "products/99/ring.jpg",
+            },
         ],
     }
     connection.execute(
@@ -100,6 +105,7 @@ def test_admin_data_summary_list_and_detail(tmp_path, monkeypatch):
     assert products["items"][0]["thumbnail"] == (
         "https://cdn.test/media/products/99/ring.jpg"
     )
+    assert products["items"][0]["image_count"] == 1
     assert detail is not None
     assert detail["quality"]["complete"] is True
     assert detail["media"][0]["display_url"].startswith("https://cdn.test/")
@@ -127,6 +133,52 @@ def test_admin_images_use_private_s3_signed_url_when_cdn_is_placeholder(
     assert settings["public_media_url"] == ""
     assert settings["media_delivery"] == "private_s3_signed"
     assert settings["public_media_url_ignored"] is True
+
+
+def test_service_restores_s3_checkpoint_on_startup(tmp_path, monkeypatch):
+    export = tmp_path / "export"
+    database = export / "catalog.sqlite"
+    calls = []
+
+    def restore(destination):
+        calls.append(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        _catalog(destination / "catalog.sqlite")
+        return True
+
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+    monkeypatch.setattr(service, "download_checkpoint", restore)
+
+    assert service._restore_runtime_checkpoint() is True
+    assert database.exists()
+    assert service._restore_runtime_checkpoint() is False
+    assert calls == [export]
+
+
+def test_service_gracefully_stops_active_crawl(monkeypatch):
+    class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+            self.wait_timeouts = []
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            return 0
+
+    current = FakeProcess()
+    monkeypatch.setattr(service, "process", current)
+
+    service._graceful_shutdown_crawl()
+
+    assert current.terminated is True
+    assert current.wait_timeouts == [240]
 
 
 def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch):

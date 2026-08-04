@@ -208,7 +208,7 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
 .catalog-discovery__header { min-height: 62px; }
 .catalog-discovery__header > div { display: grid; gap: 4px; }
 .catalog-discovery__header span { color: var(--muted); font-size: .69rem; }
-.catalog-discovery__summary { display: grid; grid-template-columns: repeat(3, minmax(130px, 1fr)) auto; align-items: stretch; border-bottom: 1px solid var(--border); }
+.catalog-discovery__summary { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)) auto; align-items: stretch; border-bottom: 1px solid var(--border); }
 .catalog-discovery__summary > div { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; align-content: center; min-height: 78px; padding: 12px 16px; border-right: 1px solid var(--border); }
 .catalog-discovery__summary small { grid-column: 1 / -1; color: var(--muted); font-size: .64rem; }
 .catalog-discovery__summary strong { color: var(--emerald); font-size: 1.22rem; }

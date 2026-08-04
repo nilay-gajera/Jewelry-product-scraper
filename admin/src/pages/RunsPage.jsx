@@ -8,7 +8,7 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
   const [runs, setRuns] = useState([]);
   const [config, setConfig] = useState(settings?.crawl || {});
   const [selected, setSelected] = useState(status || null);
-  const [discovery, setDiscovery] = useState({ total_products: 0, categories: [] });
+  const [discovery, setDiscovery] = useState({ total_products: 0, woocommerce_products: 0, categories: [] });
   const [discovering, setDiscovering] = useState(false);
   useEffect(() => setConfig(settings?.crawl || {}), [settings]);
   useEffect(() => { api("/api/runs").then((value) => setRuns(value.items || [])).catch(onError); }, [status?.state, onError]);
@@ -55,14 +55,15 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
     </section>
     <section className="catalog-discovery panel">
       <div className="panel-header catalog-discovery__header">
-        <div><h2>Catalog discovery</h2><span>Count first, then choose which categories the product crawl may visit.</span></div>
-        <Button disabled={active || discovering} onClick={refreshDiscovery}>{discovering ? "Counting…" : "Count full catalog"}</Button>
+        <div><h2>Inventory discovery</h2><span>Separate WooCommerce products from the site's independently served loose-diamond inventory.</span></div>
+        <Button disabled={active || discovering} onClick={refreshDiscovery}>{discovering ? "Counting…" : "Refresh inventory counts"}</Button>
       </div>
       {discovery.discovered_at ? <>
         <div className="catalog-discovery__summary">
-          <div><small>Full catalog</small><strong>{formatNumber(discovery.total_products)}</strong><span>products</span></div>
+          <div><small>WooCommerce catalog</small><strong>{formatNumber(discovery.woocommerce_products || discovery.total_products)}</strong><span>products</span></div>
+          <div><small>Loose-diamond inventory</small><strong>{discovery.advertised_diamond_inventory_label || "Unavailable"}</strong><span>{discovery.advertised_diamond_inventory ? "advertised" : "separate feed"}</span></div>
           <div><small>Categories found</small><strong>{formatNumber(discovery.total_categories)}</strong><span>categories</span></div>
-          <div><small>Selected scope</small><strong>{selectedIds.size ? formatNumber(selectedCount) : formatNumber(discovery.total_products)}</strong><span>{selectedIds.size ? "category assignments" : "all products"}</span></div>
+          <div><small>Selected Woo scope</small><strong>{selectedIds.size ? formatNumber(selectedCount) : formatNumber(discovery.woocommerce_products || discovery.total_products)}</strong><span>{selectedIds.size ? "category assignments" : "all Woo products"}</span></div>
           <button type="button" disabled={!selectedIds.size} onClick={() => update("category_ids", [])}>Clear selection</button>
         </div>
         <div className="category-picker" aria-label="Catalog categories">
@@ -71,8 +72,8 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
             <span><strong>{category.path || category.name}</strong><small>{formatNumber(category.count)} products</small></span>
           </label>)}
         </div>
-        <p className="catalog-discovery__note">Category counts can overlap. The crawler de-duplicates products assigned to more than one selected category.</p>
-      </> : <EmptyState icon="runs" title="Catalog not counted yet" body="Run discovery to get the full product total and category-level counts without downloading product details or images." />}
+        <p className="catalog-discovery__note">Category counts apply only to WooCommerce products and can overlap. Loose diamonds come from a separate dynamic inventory feed and are not included in this category crawl.</p>
+      </> : <EmptyState icon="runs" title="Inventory not counted yet" body="Run discovery to count WooCommerce products, read the loose-diamond inventory claim, and load category-level counts without downloading product details or images." />}
     </section>
     <div className="runs-layout">
       <section className="panel panel--table"><div className="panel-header"><h2>Run history</h2><span>{runs.length} recorded runs</span></div>{runs.length ? <div className="table-scroll"><table><thead><tr><th>Started</th><th>State</th><th>Products</th><th>Variations</th><th>Images</th><th>Diagnostics</th><th>Checkpoint</th><th /></tr></thead><tbody>{runs.map((run) => { const counts = run.summary?.database_counts || {}; return <tr key={run.run_id} onClick={() => setSelected(run)} className="clickable-row"><td>{formatDate(run.started_at)}</td><td><StatusMark state={run.state || "unknown"} /></td><td>{formatNumber(counts.products)}</td><td>{formatNumber(counts.variations)}</td><td>{formatNumber(counts.images)}</td><td>{formatNumber(counts.diagnostics)}</td><td>{run.checkpoint_restored ? "Restored" : "Fresh"}</td><td><Icon name="chevron" /></td></tr>; })}</tbody></table></div> : <EmptyState icon="runs" title="No run history" body="Completed and interrupted runs persisted to S3 appear here." />}</section>

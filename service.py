@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import secrets
@@ -8,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -52,7 +54,42 @@ ADMIN_DIST = PROJECT_DIR / "admin_dist"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Jewelry Product Scraper", version="1.0.0")
+state_lock = threading.Lock()
+process: subprocess.Popen[str] | None = None
+
+
+def _restore_runtime_checkpoint() -> bool:
+    """Hydrate Render's ephemeral disk before the admin API serves data."""
+
+    if DATABASE_PATH.exists():
+        return False
+    return download_checkpoint(EXPORT_DIR)
+
+
+def _graceful_shutdown_crawl() -> None:
+    """Give Scrapy time to close SQLite and upload its final S3 checkpoint."""
+
+    current = process
+    if current is None or current.poll() is not None:
+        return
+    current.terminate()
+    try:
+        current.wait(timeout=240)
+    except subprocess.TimeoutExpired:
+        current.kill()
+        current.wait(timeout=10)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await asyncio.to_thread(_restore_runtime_checkpoint)
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(_graceful_shutdown_crawl)
+
+
+app = FastAPI(title="Jewelry Product Scraper", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -64,9 +101,6 @@ if (ADMIN_DIST / "assets").exists():
     app.mount(
         "/assets", StaticFiles(directory=ADMIN_DIST / "assets"), name="admin-assets"
     )
-
-state_lock = threading.Lock()
-process: subprocess.Popen[str] | None = None
 
 
 class CrawlSettings(BaseModel):
@@ -409,6 +443,9 @@ def get_discovery() -> dict[str, Any]:
         value = load_json_object("admin", "catalog-discovery.json")
     return value if isinstance(value, dict) else {
         "total_products": 0,
+        "woocommerce_products": 0,
+        "advertised_diamond_inventory": None,
+        "advertised_diamond_inventory_label": None,
         "total_categories": 0,
         "categories": [],
         "discovered_at": None,

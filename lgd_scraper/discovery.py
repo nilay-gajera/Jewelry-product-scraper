@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import html
+import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin
@@ -12,6 +14,12 @@ from lgd_scraper.middlewares import parse_sucuri_cookie
 
 class CatalogDiscoveryError(RuntimeError):
     pass
+
+
+_DIAMOND_INVENTORY_RE = re.compile(
+    r"collection\s+of\s+([\d,.]+)\+[^<]{0,180}certified\s+lab\s+diamonds",
+    re.IGNORECASE,
+)
 
 
 def discover_catalog(
@@ -55,17 +63,47 @@ def discover_catalog(
             headers=headers,
         )
         normalized = _normalize_categories(categories)
+        advertised_diamonds = _advertised_diamond_inventory(
+            api_client, base_url, headers=headers
+        )
         return {
             "base_url": base_url.rstrip("/") + "/",
             "discovered_at": datetime.now(UTC).isoformat(),
             "source": "rest" if authenticated else "store",
             "total_products": total_products,
+            "woocommerce_products": total_products,
+            "advertised_diamond_inventory": advertised_diamonds,
+            "advertised_diamond_inventory_label": (
+                f"{advertised_diamonds:,}+" if advertised_diamonds else None
+            ),
             "total_categories": len(normalized),
             "categories": normalized,
         }
     finally:
         if owned_client:
             api_client.close()
+
+
+def _advertised_diamond_inventory(
+    client: httpx.Client,
+    base_url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> int | None:
+    """Read the separate loose-diamond inventory claim from the storefront."""
+
+    try:
+        response = _get(client, base_url.rstrip("/") + "/", headers=headers)
+    except CatalogDiscoveryError:
+        return None
+    visible_text = html.unescape(re.sub(r"<[^>]+>", " ", response.text))
+    match = _DIAMOND_INVENTORY_RE.search(visible_text)
+    if not match:
+        return None
+    try:
+        return int(re.sub(r"[^0-9]", "", match.group(1)))
+    except ValueError:
+        return None
 
 
 def _get(
