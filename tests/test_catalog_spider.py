@@ -62,6 +62,10 @@ def test_product_page_extracts_variations_attributes_categories_and_images():
                 "full_src": "https://example.test/variation-white.jpg",
                 "alt": "White gold ring",
             },
+            "variation_gallery_images": [
+                {"src": "https://example.test/variation-side.jpg", "alt": "Side"},
+                {"src": "https://example.test/variation-hand.jpg", "alt": "On hand"},
+            ],
         }
     ]
     page = f"""
@@ -113,6 +117,10 @@ def test_product_page_extracts_variations_attributes_categories_and_images():
     assert product["variations"][0]["id"] == 501
     assert product["variations"][0]["attributes"]["metal"] == "14k-white-gold"
     assert any(media["role"] == "variation" for media in product["media"])
+    assert len(product["variations"][0]["gallery"]) == 2
+    assert sum(
+        media["role"] == "variation_gallery" for media in product["media"]
+    ) == 2
 
 
 def test_sucuri_geo_block_detection():
@@ -128,4 +136,3 @@ def test_sucuri_geo_block_detection():
     assert spider._is_blocked(response)
     spider._record_block(response)
     assert spider.access_blocked is True
-

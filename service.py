@@ -4,61 +4,134 @@ import json
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, HttpUrl
 
-from lgd_scraper.s3sync import download_checkpoint, presigned_artifact_url
+from lgd_scraper.admin_data import (
+    catalog_summary,
+    diagnostics,
+    effective_settings,
+    list_products,
+    persist_settings,
+    product_detail,
+    secret_presence,
+    storage_settings,
+)
+from lgd_scraper.s3sync import (
+    download_checkpoint,
+    list_admin_runs,
+    presigned_artifact_url,
+    save_json_object,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", PROJECT_DIR / "runtime")).resolve()
 EXPORT_DIR = RUNTIME_DIR / "export"
+DATABASE_PATH = EXPORT_DIR / "catalog.sqlite"
 LOG_PATH = RUNTIME_DIR / "crawl.log"
 STATUS_PATH = RUNTIME_DIR / "status.json"
+SETTINGS_PATH = RUNTIME_DIR / "admin-settings.json"
+PROGRESS_PATH = EXPORT_DIR / "progress.json"
+ADMIN_DIST = PROJECT_DIR / "admin_dist"
 
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Jewelry Product Scraper", version="0.2.0")
+app = FastAPI(title="Jewelry Product Scraper", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+if (ADMIN_DIST / "assets").exists():
+    app.mount(
+        "/assets", StaticFiles(directory=ADMIN_DIST / "assets"), name="admin-assets"
+    )
+
 state_lock = threading.Lock()
 process: subprocess.Popen[str] | None = None
 
 
+class CrawlSettings(BaseModel):
+    base_url: HttpUrl = "https://www.loosegrowndiamond.com/"
+    mode: Literal["test", "full"] = "test"
+    max_products: int = Field(default=5, ge=0, le=1_000_000)
+    concurrency: int = Field(default=2, ge=1, le=16)
+    download_delay: float = Field(default=1.0, ge=0.1, le=60)
+    download_timeout: int = Field(default=45, ge=5, le=300)
+    retry_times: int = Field(default=3, ge=0, le=10)
+    enrich_html: bool = True
+    download_media: bool = True
+    resume_checkpoint: bool = True
+    obey_robots: bool = True
+
+
 class StartRequest(BaseModel):
-    max_products: int = Field(default=0, ge=0, le=100_000)
+    base_url: HttpUrl | None = None
+    mode: Literal["test", "full"] | None = None
+    max_products: int | None = Field(default=None, ge=0, le=1_000_000)
+    concurrency: int | None = Field(default=None, ge=1, le=16)
+    download_delay: float | None = Field(default=None, ge=0.1, le=60)
+    download_timeout: int | None = Field(default=None, ge=5, le=300)
+    retry_times: int | None = Field(default=None, ge=0, le=10)
+    enrich_html: bool | None = None
+    download_media: bool | None = None
+    resume_checkpoint: bool | None = None
+    obey_robots: bool | None = None
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def _default_state() -> dict[str, Any]:
     return {
         "state": "idle",
+        "run_id": None,
         "started_at": None,
         "finished_at": None,
         "exit_code": None,
-        "max_products": None,
+        "config": None,
         "checkpoint_restored": False,
         "summary": None,
         "message": "Ready to start.",
     }
 
 
-def _read_state() -> dict[str, Any]:
-    if not STATUS_PATH.exists():
-        return _default_state()
+def _process_running() -> bool:
+    return process is not None and process.poll() is None
+
+
+def _read_json(path: Path) -> Any:
+    if not path.exists():
+        return None
     try:
-        state = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return _default_state()
+        return None
+
+
+def _read_state() -> dict[str, Any]:
+    state = _read_json(STATUS_PATH)
+    if not isinstance(state, dict):
+        state = _default_state()
     if state.get("state") == "running" and not _process_running():
         state["state"] = "interrupted"
-        state["message"] = "The previous process stopped. Start again to resume from S3."
+        state["message"] = "The process stopped. Start again to resume from S3."
     return state
 
 
@@ -70,93 +143,119 @@ def _write_state(state: dict[str, Any]) -> None:
     temporary.replace(STATUS_PATH)
 
 
-def _process_running() -> bool:
-    return process is not None and process.poll() is None
+def _persist_run(state: dict[str, Any]) -> None:
+    run_id = state.get("run_id")
+    if not run_id:
+        return
+    payload = {
+        key: state.get(key)
+        for key in (
+            "run_id",
+            "state",
+            "started_at",
+            "finished_at",
+            "exit_code",
+            "checkpoint_restored",
+            "config",
+            "summary",
+            "message",
+        )
+    }
+    save_json_object(payload, "admin", "runs", f"{run_id}.json")
 
 
 def _require_control(authorization: str | None = Header(default=None)) -> None:
     expected = os.getenv("CONTROL_TOKEN")
     if not expected:
-        raise HTTPException(
-            status_code=503,
-            detail="CONTROL_TOKEN is not configured on this service.",
-        )
+        raise HTTPException(503, "CONTROL_TOKEN is not configured on this service.")
     supplied = ""
     if authorization and authorization.startswith("Bearer "):
         supplied = authorization.removeprefix("Bearer ").strip()
     if not secrets.compare_digest(supplied, expected):
-        raise HTTPException(status_code=401, detail="Invalid control token.")
+        raise HTTPException(401, "Invalid control token.")
 
 
-def _configure_crawl_environment() -> dict[str, str]:
+def _merged_start_settings(request: StartRequest) -> dict[str, Any]:
+    values = effective_settings(SETTINGS_PATH)
+    provided = request.model_dump(exclude_none=True, mode="json")
+    values.update(provided)
+    if values["mode"] == "full":
+        values["max_products"] = 0
+    return CrawlSettings.model_validate(values).model_dump(mode="json")
+
+
+def _configure_crawl_environment(config: dict[str, Any], run_id: str) -> dict[str, str]:
     environment = dict(os.environ)
     bucket = environment.get("S3_BUCKET")
     if bucket and not environment.get("SCRAPER_MEDIA_STORE"):
-        prefix = environment.get(
-            "S3_PREFIX", "jewelry-product-scraper"
-        ).strip("/")
-        environment["SCRAPER_MEDIA_STORE"] = (
-            f"s3://{bucket}/{prefix}/media/"
-        )
-    environment["SCRAPER_JOBDIR"] = str(
-        RUNTIME_DIR
-        / "jobs"
-        / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        prefix = environment.get("S3_PREFIX", "jewelry-product-scraper").strip("/")
+        environment["SCRAPER_MEDIA_STORE"] = f"s3://{bucket}/{prefix}/media/"
+    environment.update(
+        {
+            "SCRAPER_RUN_ID": run_id,
+            "SCRAPER_JOBDIR": str(RUNTIME_DIR / "jobs" / run_id),
+            "SCRAPER_LOG_LEVEL": environment.get("SCRAPER_LOG_LEVEL", "INFO"),
+            "SCRAPER_CONCURRENCY": str(config["concurrency"]),
+            "SCRAPER_DOWNLOAD_DELAY": str(config["download_delay"]),
+            "SCRAPER_DOWNLOAD_TIMEOUT": str(config["download_timeout"]),
+            "SCRAPER_RETRY_TIMES": str(config["retry_times"]),
+            "SCRAPER_DOWNLOAD_MEDIA": "1" if config["download_media"] else "0",
+            "SCRAPER_OBEY_ROBOTS": "1" if config["obey_robots"] else "0",
+        }
     )
-    environment["SCRAPER_LOG_LEVEL"] = environment.get(
-        "SCRAPER_LOG_LEVEL", "INFO"
-    )
+    proxy = environment.get("SCRAPER_PROXY_URL")
+    if proxy:
+        environment["HTTPS_PROXY"] = proxy
+        environment["HTTP_PROXY"] = proxy
     return environment
 
 
-def _watch_process(current_process: subprocess.Popen[str]) -> None:
-    exit_code = current_process.wait()
-    summary_path = EXPORT_DIR / "crawl-summary.json"
-    summary = None
-    if summary_path.exists():
-        try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            summary = None
+def _clear_local_catalog() -> None:
+    for name in (
+        "catalog.sqlite",
+        "catalog.sqlite-wal",
+        "catalog.sqlite-shm",
+        "products.jsonl",
+        "categories.jsonl",
+        "attributes.jsonl",
+        "diagnostics.jsonl",
+        "progress.json",
+    ):
+        (EXPORT_DIR / name).unlink(missing_ok=True)
 
+
+def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
+    exit_code = current_process.wait()
+    summary = _read_json(EXPORT_DIR / "crawl-summary.json")
     archive = EXPORT_DIR / "catalog-export.zip"
     archive.unlink(missing_ok=True)
-    shutil.make_archive(
-        str(archive.with_suffix("")),
-        "zip",
-        root_dir=EXPORT_DIR,
-    )
-    upload_error_path = EXPORT_DIR / "s3-upload-error.json"
-    upload_error = None
-    if upload_error_path.exists():
-        try:
-            upload_error = json.loads(
-                upload_error_path.read_text(encoding="utf-8")
-            ).get("error")
-        except (json.JSONDecodeError, OSError):
-            upload_error = "S3 upload failed."
+    shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=EXPORT_DIR)
+    upload_error = _read_json(EXPORT_DIR / "s3-upload-error.json")
     successful = exit_code == 0 and not upload_error
 
     with state_lock:
         state = _read_state()
+        if state.get("run_id") != run_id:
+            return
         state.update(
             {
                 "state": "completed" if successful else "failed",
-                "finished_at": datetime.now(UTC).isoformat(),
+                "finished_at": _now(),
                 "exit_code": exit_code,
                 "summary": summary,
                 "message": (
-                    "Crawl completed. Download the WooCommerce export."
+                    "Crawl completed. Review products or download the export."
                     if successful
                     else (
-                        f"S3 upload failed: {upload_error}"
-                        if upload_error
-                        else "Crawl failed. Review the log."
+                        f"S3 upload failed: {upload_error.get('error')}"
+                        if isinstance(upload_error, dict)
+                        else "Crawl failed. Review the live log."
                     )
                 ),
             }
         )
         _write_state(state)
+        _persist_run(state)
 
 
 @app.get("/health")
@@ -164,94 +263,9 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Jewelry Product Scraper</title>
-  <style>
-    body { font: 16px/1.5 system-ui, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; color: #18212f; }
-    input, button { font: inherit; padding: 10px 12px; margin: 4px; }
-    input[type=password] { min-width: 320px; }
-    button { cursor: pointer; }
-    pre { background: #0b1220; color: #d8e5ff; padding: 16px; overflow: auto; border-radius: 8px; min-height: 160px; }
-    .warning { background: #fff4d6; padding: 12px 16px; border-radius: 8px; }
-  </style>
-</head>
-<body>
-  <h1>Jewelry Product Scraper</h1>
-  <p class="warning">Render Free can stop an idle service. Keep this page open while a crawl is running. S3 checkpoints preserve normalized product data.</p>
-  <p>
-    <input id="token" type="password" placeholder="CONTROL_TOKEN">
-    <input id="limit" type="number" min="0" value="5" title="0 means full catalog">
-  </p>
-  <p>
-    <button onclick="startCrawl()">Start crawl</button>
-    <button onclick="stopCrawl()">Stop</button>
-    <button onclick="downloadExport()">Download export</button>
-  </p>
-  <pre id="status">Enter the control token to view status.</pre>
-  <pre id="logs"></pre>
-  <script>
-    const tokenInput = document.getElementById('token');
-    tokenInput.value = sessionStorage.getItem('controlToken') || '';
-    function headers() {
-      const token = tokenInput.value.trim();
-      sessionStorage.setItem('controlToken', token);
-      return {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'};
-    }
-    async function api(path, options={}) {
-      options.headers = {...headers(), ...(options.headers || {})};
-      const response = await fetch(path, options);
-      if (!response.ok) throw new Error(await response.text());
-      return response;
-    }
-    async function refresh() {
-      if (!tokenInput.value.trim()) return;
-      try {
-        const status = await (await api('/api/status')).json();
-        document.getElementById('status').textContent = JSON.stringify(status, null, 2);
-        const logs = await (await api('/api/logs')).text();
-        document.getElementById('logs').textContent = logs;
-      } catch (error) {
-        document.getElementById('status').textContent = String(error);
-      }
-    }
-    async function startCrawl() {
-      const max_products = Number(document.getElementById('limit').value || 0);
-      await api('/api/start', {method: 'POST', body: JSON.stringify({max_products})});
-      refresh();
-    }
-    async function stopCrawl() {
-      await api('/api/stop', {method: 'POST'});
-      refresh();
-    }
-    async function downloadExport() {
-      const response = await api('/api/download');
-      const data = await response.json();
-      if (data.url.startsWith('/')) {
-        const file = await api(data.url);
-        const blobUrl = URL.createObjectURL(await file.blob());
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.download = 'catalog-export.zip';
-        link.click();
-        URL.revokeObjectURL(blobUrl);
-      } else {
-        window.location.href = data.url;
-      }
-    }
-    tokenInput.addEventListener('change', refresh);
-    setInterval(refresh, 10000);
-    refresh();
-  </script>
-</body>
-</html>
-"""
+@app.get("/api/session", dependencies=[Depends(_require_control)])
+def session() -> dict[str, Any]:
+    return {"authenticated": True, "service": "Jewelry Scraper", "version": "1.0.0"}
 
 
 @app.get("/api/status", dependencies=[Depends(_require_control)])
@@ -259,7 +273,10 @@ def status() -> dict[str, Any]:
     with state_lock:
         state = _read_state()
         state["process_running"] = _process_running()
-        return state
+    progress = _read_json(PROGRESS_PATH)
+    state["progress"] = progress if isinstance(progress, dict) else None
+    state["catalog"] = catalog_summary(DATABASE_PATH)
+    return state
 
 
 @app.get(
@@ -267,11 +284,11 @@ def status() -> dict[str, Any]:
     dependencies=[Depends(_require_control)],
     response_class=PlainTextResponse,
 )
-def logs() -> str:
+def logs(lines: int = Query(default=250, ge=20, le=2000)) -> str:
     if not LOG_PATH.exists():
         return ""
-    lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(lines[-200:])
+    values = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(values[-lines:])
 
 
 @app.post("/api/start", dependencies=[Depends(_require_control)])
@@ -279,11 +296,18 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
     global process
     with state_lock:
         if _process_running():
-            raise HTTPException(status_code=409, detail="A crawl is already running.")
+            raise HTTPException(409, "A crawl is already running.")
 
-        checkpoint_restored = download_checkpoint(EXPORT_DIR)
+        config = _merged_start_settings(request)
+        run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        if config["resume_checkpoint"]:
+            checkpoint_restored = download_checkpoint(EXPORT_DIR)
+        else:
+            _clear_local_catalog()
+            checkpoint_restored = False
+        PROGRESS_PATH.unlink(missing_ok=True)
         (EXPORT_DIR / "s3-upload-error.json").unlink(missing_ok=True)
-        environment = _configure_crawl_environment()
+        environment = _configure_crawl_environment(config, run_id)
         command = [
             sys.executable,
             "-m",
@@ -291,9 +315,13 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
             "crawl",
             "catalog",
             "-a",
+            f"base_url={config['base_url']}",
+            "-a",
             f"output_dir={EXPORT_DIR}",
             "-a",
-            f"max_products={request.max_products}",
+            f"max_products={config['max_products']}",
+            "-a",
+            f"enrich_html={'true' if config['enrich_html'] else 'false'}",
             "-a",
             "use_playwright=false",
         ]
@@ -310,17 +338,19 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
         log_handle.close()
         state = {
             "state": "running",
-            "started_at": datetime.now(UTC).isoformat(),
+            "run_id": run_id,
+            "started_at": _now(),
             "finished_at": None,
             "exit_code": None,
-            "max_products": request.max_products,
+            "config": config,
             "checkpoint_restored": checkpoint_restored,
             "summary": None,
-            "message": "Crawl is running. Keep this page open on Render Free.",
+            "message": "Crawl is running. Checkpoints are saved to S3.",
         }
         _write_state(state)
+        _persist_run(state)
         threading.Thread(
-            target=_watch_process, args=(process,), daemon=True
+            target=_watch_process, args=(process, run_id), daemon=True
         ).start()
         return state
 
@@ -331,7 +361,77 @@ def stop_crawl() -> dict[str, str]:
         return {"status": "not-running"}
     assert process is not None
     process.terminate()
+    with state_lock:
+        state = _read_state()
+        state["state"] = "stopping"
+        state["message"] = "Stopping gracefully; partial data will be checkpointed."
+        _write_state(state)
+        _persist_run(state)
     return {"status": "stopping"}
+
+
+@app.get("/api/catalog/summary", dependencies=[Depends(_require_control)])
+def get_catalog_summary() -> dict[str, Any]:
+    return catalog_summary(DATABASE_PATH)
+
+
+@app.get("/api/products", dependencies=[Depends(_require_control)])
+def get_products(
+    q: str = Query(default="", max_length=200),
+    product_type: str = Query(default="", max_length=30),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+) -> dict[str, Any]:
+    return list_products(
+        DATABASE_PATH,
+        query=q.strip(),
+        product_type=product_type.strip(),
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/products/{product_id}", dependencies=[Depends(_require_control)])
+def get_product(product_id: str) -> dict[str, Any]:
+    value = product_detail(DATABASE_PATH, product_id)
+    if value is None:
+        raise HTTPException(404, "Product not found.")
+    return value
+
+
+@app.get("/api/diagnostics", dependencies=[Depends(_require_control)])
+def get_diagnostics(limit: int = Query(default=100, ge=1, le=1000)):
+    return {"items": diagnostics(DATABASE_PATH, limit=limit)}
+
+
+@app.get("/api/runs", dependencies=[Depends(_require_control)])
+def get_runs(limit: int = Query(default=25, ge=1, le=100)) -> dict[str, Any]:
+    records = list_admin_runs(limit)
+    current = _read_state()
+    if current.get("run_id") and not any(
+        item.get("run_id") == current.get("run_id") for item in records
+    ):
+        records.insert(0, current)
+    return {"items": records[:limit]}
+
+
+@app.get("/api/settings", dependencies=[Depends(_require_control)])
+def get_settings() -> dict[str, Any]:
+    return {
+        "crawl": effective_settings(SETTINGS_PATH),
+        "storage": storage_settings(),
+        "secrets": secret_presence(),
+        "notice": "Secrets are stored in Render environment and are never returned by the API.",
+    }
+
+
+@app.put("/api/settings", dependencies=[Depends(_require_control)])
+def update_settings(settings: CrawlSettings) -> dict[str, Any]:
+    values = settings.model_dump(mode="json")
+    if values["mode"] == "full":
+        values["max_products"] = 0
+    persist_settings(SETTINGS_PATH, values)
+    return get_settings()
 
 
 @app.get("/api/download", dependencies=[Depends(_require_control)])
@@ -341,7 +441,7 @@ def download() -> dict[str, str]:
         return {"url": url}
     archive = EXPORT_DIR / "catalog-export.zip"
     if not archive.exists():
-        raise HTTPException(status_code=404, detail="No export is available.")
+        raise HTTPException(404, "No export is available.")
     return {"url": "/api/download-local"}
 
 
@@ -349,5 +449,27 @@ def download() -> dict[str, str]:
 def download_local():
     archive = EXPORT_DIR / "catalog-export.zip"
     if not archive.exists():
-        raise HTTPException(status_code=404, detail="No export is available.")
+        raise HTTPException(404, "No export is available.")
     return FileResponse(archive, filename="catalog-export.zip")
+
+
+def _admin_index() -> FileResponse | HTMLResponse:
+    index_path = ADMIN_DIST / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return HTMLResponse(
+        "<h1>Jewelry Scraper</h1><p>Admin assets are not built. Run npm build in admin/.</p>",
+        status_code=503,
+    )
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return _admin_index()
+
+
+@app.get("/{path:path}", include_in_schema=False)
+def admin_route(path: str):
+    if path.startswith("api/"):
+        raise HTTPException(404)
+    return _admin_index()

@@ -1,0 +1,23 @@
+import { useEffect, useState } from "react";
+
+import { api } from "../api.js";
+import { Icon } from "../icons.jsx";
+import { Button, Field } from "../components/Ui.jsx";
+
+export function SettingsPage({ settings, onSaved, onError }) {
+  const [form, setForm] = useState(settings?.crawl || {});
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setForm(settings?.crawl || {}), [settings]);
+  function update(key, value) { setForm((current) => ({ ...current, [key]: value })); }
+  async function save(event) { event.preventDefault(); setBusy(true); try { const value = await api("/api/settings", { method: "PUT", body: JSON.stringify(form) }); onSaved(value); } catch (error) { onError(error); } finally { setBusy(false); } }
+  const storage = settings?.storage || {};
+  const secrets = settings?.secrets || {};
+  return <main className="page"><header className="page-header"><div><h1>Settings</h1><p>Non-secret crawl defaults are saved to S3. Credentials remain in Render environment.</p></div><Button tone="primary" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save settings"}</Button></header><div className="settings-layout"><nav className="settings-nav"><a href="#connection">Connection</a><a href="#behavior">Crawl behavior</a><a href="#storage">Storage</a><a href="#security">Security</a></nav><form className="settings-form" onSubmit={save}>
+    <section id="connection"><h2>Connection</h2><p>Source and WooCommerce access mode.</p><div className="form-grid"><Field label="Source base URL"><input value={form.base_url || ""} onChange={(event) => update("base_url", event.target.value)} /></Field><Field label="Default mode"><select value={form.mode || "test"} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full catalog</option></select></Field></div><Presence label="WooCommerce consumer key" present={secrets.woocommerce_key} /><Presence label="WooCommerce consumer secret" present={secrets.woocommerce_secret} /><Presence label="Proxy URL" present={secrets.proxy} /></section>
+    <section id="behavior"><h2>Crawl behavior</h2><p>Conservative defaults protect the source site and the Render free instance.</p><div className="form-grid"><Field label="Product limit"><input type="number" min="0" value={form.max_products ?? 5} onChange={(event) => update("max_products", Number(event.target.value))} /></Field><Field label="Concurrency"><input type="number" min="1" max="16" value={form.concurrency ?? 2} onChange={(event) => update("concurrency", Number(event.target.value))} /></Field><Field label="Download delay"><input type="number" min="0.1" step="0.1" value={form.download_delay ?? 1} onChange={(event) => update("download_delay", Number(event.target.value))} /></Field><Field label="Request timeout"><input type="number" min="5" value={form.download_timeout ?? 45} onChange={(event) => update("download_timeout", Number(event.target.value))} /></Field><Field label="Retries"><input type="number" min="0" max="10" value={form.retry_times ?? 3} onChange={(event) => update("retry_times", Number(event.target.value))} /></Field></div><div className="toggle-row toggle-row--stacked">{["obey_robots", "enrich_html", "download_media", "resume_checkpoint"].map((key) => <label key={key}><input type="checkbox" checked={Boolean(form[key])} onChange={(event) => update(key, event.target.checked)} /><span>{key.split("_").join(" ")}</span></label>)}</div></section>
+    <section id="storage"><h2>Storage</h2><p>S3 artifacts and media destinations are read from Render environment.</p><dl className="settings-list"><div><dt>Bucket</dt><dd>{storage.bucket || "Not configured"}</dd></div><div><dt>Prefix</dt><dd>{storage.prefix || "—"}</dd></div><div><dt>Region</dt><dd>{storage.region || "—"}</dd></div><div><dt>Public media URL</dt><dd>{storage.public_media_url || "Uses source URLs"}</dd></div></dl></section>
+    <section id="security"><h2>Security</h2><div className="security-notice"><Icon name="alert" /><span><strong>Secrets are never returned by this API.</strong> Update AWS, WooCommerce, proxy, and control credentials in Render Environment.</span></div><Presence label="AWS access key" present={secrets.aws_access_key} /><Presence label="AWS secret key" present={secrets.aws_secret_key} /><Presence label="S3 bucket" present={secrets.s3_bucket} /></section>
+  </form></div></main>;
+}
+
+function Presence({ label, present }) { return <div className="presence-row"><span>{label}</span><strong className={present ? "presence-ok" : "presence-missing"}><Icon name={present ? "check" : "alert"} />{present ? "Configured" : "Missing"}</strong></div>; }

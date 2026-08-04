@@ -8,7 +8,12 @@ BOT_NAME = "lgd_scraper"
 SPIDER_MODULES = ["lgd_scraper.spiders"]
 NEWSPIDER_MODULE = "lgd_scraper.spiders"
 
-ROBOTSTXT_OBEY = True
+ROBOTSTXT_OBEY = os.getenv("SCRAPER_OBEY_ROBOTS", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 COOKIES_ENABLED = True
 
 # Conservative defaults: this is a focused catalog export, not a broad crawl.
@@ -16,7 +21,7 @@ CONCURRENT_REQUESTS = int(os.getenv("SCRAPER_CONCURRENCY", "2"))
 CONCURRENT_REQUESTS_PER_DOMAIN = int(os.getenv("SCRAPER_CONCURRENCY", "2"))
 DOWNLOAD_DELAY = float(os.getenv("SCRAPER_DOWNLOAD_DELAY", "1.0"))
 RANDOMIZE_DOWNLOAD_DELAY = True
-DOWNLOAD_TIMEOUT = 45
+DOWNLOAD_TIMEOUT = int(os.getenv("SCRAPER_DOWNLOAD_TIMEOUT", "45"))
 
 AUTOTHROTTLE_ENABLED = True
 AUTOTHROTTLE_START_DELAY = 1.0
@@ -24,7 +29,7 @@ AUTOTHROTTLE_MAX_DELAY = 30.0
 AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
 
 RETRY_ENABLED = True
-RETRY_TIMES = 3
+RETRY_TIMES = int(os.getenv("SCRAPER_RETRY_TIMES", "3"))
 RETRY_HTTP_CODES = [408, 425, 429, 500, 502, 503, 504, 522, 524]
 
 HTTPCACHE_ENABLED = True
@@ -47,6 +52,12 @@ ITEM_PIPELINES = {
     "lgd_scraper.pipelines.CatalogMediaPipeline": 100,
     "lgd_scraper.pipelines.CatalogWriterPipeline": 300,
 }
+CATALOG_DOWNLOAD_MEDIA = os.getenv("SCRAPER_DOWNLOAD_MEDIA", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 DOWNLOADER_MIDDLEWARES = {
     "lgd_scraper.middlewares.SucuriCookieChallengeMiddleware": 650,
@@ -55,7 +66,7 @@ SUCURI_CHALLENGE_MAX_RETRIES = 2
 
 FILES_STORE = os.getenv("SCRAPER_MEDIA_STORE", "outputs/catalog/media")
 FILES_EXPIRES = 0
-FILES_STORE_S3_ACL = os.getenv("S3_MEDIA_ACL", "private")
+FILES_STORE_S3_ACL = os.getenv("S3_MEDIA_ACL", "none")
 
 # Do not copy credentials into Scrapy settings. Scrapy prints overridden
 # settings at startup, while botocore can securely discover the same values

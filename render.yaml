@@ -17,7 +17,7 @@ services:
       - key: S3_PUBLIC_BASE_URL
         sync: false
       - key: S3_MEDIA_ACL
-        value: private
+        value: none
       - key: S3_UPLOAD_EVERY
         value: "10"
       - key: S3_RESTORE_CHECKPOINT

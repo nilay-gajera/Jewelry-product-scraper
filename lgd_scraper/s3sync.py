@@ -42,6 +42,80 @@ def _key(*parts: str) -> str:
     return "/".join(value for value in values if value)
 
 
+def load_json_object(*parts: str) -> dict[str, Any] | list[Any] | None:
+    """Load a small JSON control-plane object from the configured bucket."""
+
+    if not s3_enabled():
+        return None
+    try:
+        response = s3_client().get_object(
+            Bucket=os.environ["S3_BUCKET"], Key=_key(*parts)
+        )
+        return json.loads(response["Body"].read().decode("utf-8"))
+    except Exception as exc:
+        error_code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+        if error_code not in {"404", "NoSuchKey", "NotFound"}:
+            LOGGER.warning("Could not load S3 JSON object %s: %s", _key(*parts), exc)
+        return None
+
+
+def save_json_object(payload: Any, *parts: str) -> bool:
+    """Persist a small non-secret JSON object used by the admin service."""
+
+    if not s3_enabled():
+        return False
+    try:
+        s3_client().put_object(
+            Bucket=os.environ["S3_BUCKET"],
+            Key=_key(*parts),
+            Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            ContentType="application/json",
+            **_extra_args(),
+        )
+        return True
+    except Exception as exc:
+        LOGGER.warning("Could not save S3 JSON object %s: %s", _key(*parts), exc)
+        return False
+
+
+def list_admin_runs(limit: int = 50) -> list[dict[str, Any]]:
+    """Return the newest persisted run records without exposing credentials."""
+
+    if not s3_enabled():
+        return []
+    client = s3_client()
+    prefix = _key("admin", "runs") + "/"
+    try:
+        response = client.list_objects_v2(
+            Bucket=os.environ["S3_BUCKET"], Prefix=prefix, MaxKeys=max(1, limit)
+        )
+    except Exception as exc:
+        LOGGER.warning("Could not list S3 run records: %s", exc)
+        return []
+
+    records: list[dict[str, Any]] = []
+    objects = sorted(
+        response.get("Contents", []),
+        key=lambda item: item.get("LastModified") or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    for item in objects[:limit]:
+        key = str(item.get("Key") or "")
+        if not key.endswith(".json"):
+            continue
+        try:
+            payload = client.get_object(
+                Bucket=os.environ["S3_BUCKET"], Key=key
+            )
+            value = json.loads(payload["Body"].read().decode("utf-8"))
+        except Exception as exc:
+            LOGGER.warning("Could not read S3 run record %s: %s", key, exc)
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
 def download_checkpoint(output_dir: Path) -> bool:
     """Restore the latest normalized database before a restarted free-tier run."""
 
@@ -236,5 +310,11 @@ class S3ArtifactPipeline:
                 str(manifest_path),
                 self.bucket,
                 _key("latest", manifest_path.name),
+                ExtraArgs=_extra_args(),
+            )
+            client.upload_file(
+                str(manifest_path),
+                self.bucket,
+                _key("runs", run_id, manifest_path.name),
                 ExtraArgs=_extra_args(),
             )

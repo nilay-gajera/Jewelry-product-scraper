@@ -12,7 +12,9 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from scrapy import Request
-from scrapy.pipelines.files import FilesPipeline
+from scrapy.pipelines.files import FilesPipeline, S3FilesStore
+from scrapy.utils.asyncio import run_in_thread
+from scrapy.utils.defer import deferred_from_coro
 
 from lgd_scraper.s3sync import upload_final_artifacts
 from lgd_scraper.woocommerce_csv import export_woocommerce_csvs
@@ -27,11 +29,45 @@ def _safe_segment(value: Any, fallback: str = "unknown") -> str:
     return cleaned[:120] or fallback
 
 
+class CatalogS3FilesStore(S3FilesStore):
+    """S3 media store compatible with buckets that have ACLs disabled."""
+
+    def persist_file(self, path, buf, info, meta=None, headers=None):
+        key_name = f"{self.prefix}{path}"
+        buf.seek(0)
+        extra = self._headers_to_botocore_kwargs(self.HEADERS)
+        if headers:
+            extra.update(self._headers_to_botocore_kwargs(headers))
+        policy = str(self.POLICY or "").strip().lower()
+        if policy not in {"", "none", "disabled"}:
+            extra["ACL"] = self.POLICY
+        encryption = os.getenv("S3_SERVER_SIDE_ENCRYPTION", "AES256").strip()
+        if encryption:
+            extra["ServerSideEncryption"] = encryption
+        return deferred_from_coro(
+            run_in_thread(
+                self.s3_client.put_object,
+                Bucket=self.bucket,
+                Key=key_name,
+                Body=buf,
+                Metadata={key: str(value) for key, value in meta.items()}
+                if meta
+                else {},
+                **extra,
+            )
+        )
+
+
 class CatalogMediaPipeline(FilesPipeline):
     """Download each unique product/variation image and retain its associations."""
 
+    STORE_SCHEMES = {**FilesPipeline.STORE_SCHEMES, "s3": CatalogS3FilesStore}
+
     def get_media_requests(self, item, info):
-        if item.get("_record_type") != "product":
+        if (
+            item.get("_record_type") != "product"
+            or not self.crawler.settings.getbool("CATALOG_DOWNLOAD_MEDIA", True)
+        ):
             return
 
         seen: set[str] = set()
@@ -86,6 +122,7 @@ class CatalogWriterPipeline:
         self.counts: Counter[str] = Counter()
         self.crawler = None
         self.woocommerce_counts: dict[str, int] = {}
+        self.progress_path = Path("outputs/catalog/progress.json")
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -97,6 +134,7 @@ class CatalogWriterPipeline:
         spider = self.crawler.spider
         self.output_dir = Path(getattr(spider, "output_dir", "outputs/catalog")).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.progress_path = self.output_dir / "progress.json"
 
         for record_type in ("products", "categories", "attributes", "diagnostics"):
             self.handles[record_type] = (self.output_dir / f"{record_type}.jsonl").open(
@@ -217,7 +255,30 @@ class CatalogWriterPipeline:
 
         assert self.connection is not None
         self.connection.commit()
+        self._write_progress(item)
         return item
+
+    def _write_progress(self, item: dict[str, Any] | None = None) -> None:
+        payload = {
+            "run_id": os.getenv("SCRAPER_RUN_ID"),
+            "state": "running",
+            "records_seen": dict(self.counts),
+            "products_scheduled": getattr(self.crawler.spider, "products_scheduled", 0),
+            "current_product": (
+                {
+                    "id": item.get("id"),
+                    "name": item.get("name"),
+                    "url": item.get("url"),
+                }
+                if item and item.get("_record_type") == "product"
+                else None
+            ),
+        }
+        temporary = self.progress_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(self.progress_path)
 
     def _write_jsonl(self, target: str, item: dict[str, Any]) -> None:
         self.handles[target].write(_json(item) + "\n")
@@ -459,6 +520,7 @@ class CatalogWriterPipeline:
             public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
         )
         summary = {
+            "run_id": os.getenv("SCRAPER_RUN_ID"),
             "base_url": getattr(spider, "base_url", None),
             "records_seen_this_run": dict(self.counts),
             "database_counts": {
@@ -480,6 +542,15 @@ class CatalogWriterPipeline:
         }
         (self.output_dir / "crawl-summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        progress = {
+            "run_id": os.getenv("SCRAPER_RUN_ID"),
+            "state": "completed",
+            "records_seen": dict(self.counts),
+            "summary": summary,
+        }
+        self.progress_path.write_text(
+            json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
         self.connection.commit()
