@@ -6,6 +6,7 @@ import sqlite3
 from fastapi.testclient import TestClient
 
 import service
+from lgd_scraper import admin_data
 from lgd_scraper.admin_data import catalog_summary, list_products, product_detail
 
 
@@ -104,6 +105,30 @@ def test_admin_data_summary_list_and_detail(tmp_path, monkeypatch):
     assert detail["media"][0]["display_url"].startswith("https://cdn.test/")
 
 
+def test_admin_images_use_private_s3_signed_url_when_cdn_is_placeholder(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "catalog.sqlite"
+    _catalog(database)
+    monkeypatch.setenv("S3_BUCKET", "private-media")
+    monkeypatch.setenv(
+        "S3_PUBLIC_BASE_URL", "https://your-cdn-domain/jewelry-product-scraper/media"
+    )
+    monkeypatch.setattr(
+        admin_data,
+        "presigned_media_url",
+        lambda path: f"https://signed.test/{path}?signature=temporary",
+    )
+
+    products = list_products(database)
+    settings = admin_data.storage_settings()
+
+    assert products["items"][0]["thumbnail"].startswith("https://signed.test/")
+    assert settings["public_media_url"] == ""
+    assert settings["media_delivery"] == "private_s3_signed"
+    assert settings["public_media_url_ignored"] is True
+
+
 def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch):
     runtime = tmp_path / "runtime"
     export = runtime / "export"
@@ -119,7 +144,16 @@ def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch
     monkeypatch.setattr(service, "LOG_PATH", runtime / "crawl.log")
     monkeypatch.setattr(service, "STATUS_PATH", runtime / "status.json")
     monkeypatch.setattr(service, "SETTINGS_PATH", runtime / "admin-settings.json")
+    monkeypatch.setattr(service, "DISCOVERY_PATH", runtime / "catalog-discovery.json")
     monkeypatch.setattr(service, "PROGRESS_PATH", export / "progress.json")
+    discovered = {
+        "base_url": "https://example.test/",
+        "total_products": 88,
+        "total_categories": 1,
+        "categories": [{"id": "11", "name": "Rings", "count": 88}],
+    }
+    monkeypatch.setattr(service, "discover_catalog", lambda *args, **kwargs: discovered)
+    monkeypatch.setattr(service, "save_json_object", lambda *args, **kwargs: True)
 
     with TestClient(service.app) as client:
         assert client.get("/api/status").status_code == 401
@@ -128,8 +162,17 @@ def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch
         status = client.get("/api/status", headers=headers)
         products = client.get("/api/products?q=Adriana", headers=headers)
         detail = client.get("/api/products/99", headers=headers)
+        empty_discovery = client.get("/api/discovery", headers=headers)
+        refreshed_discovery = client.post(
+            "/api/discovery/refresh",
+            headers=headers,
+            json={"base_url": "https://example.test/"},
+        )
 
     assert session.status_code == 200
     assert status.json()["catalog"]["products"] == 1
     assert products.json()["items"][0]["name"] == "Adriana Ring"
     assert detail.json()["variations"][0]["id"] == 501
+    assert empty_discovery.json()["total_products"] == 0
+    assert refreshed_discovery.json()["total_products"] == 88
+    assert (runtime / "catalog-discovery.json").exists()

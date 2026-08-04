@@ -8,12 +8,35 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
   const [runs, setRuns] = useState([]);
   const [config, setConfig] = useState(settings?.crawl || {});
   const [selected, setSelected] = useState(status || null);
+  const [discovery, setDiscovery] = useState({ total_products: 0, categories: [] });
+  const [discovering, setDiscovering] = useState(false);
   useEffect(() => setConfig(settings?.crawl || {}), [settings]);
   useEffect(() => { api("/api/runs").then((value) => setRuns(value.items || [])).catch(onError); }, [status?.state, onError]);
+  useEffect(() => { api("/api/discovery").then(setDiscovery).catch(onError); }, [onError]);
   useEffect(() => { if (status?.run_id) setSelected(status); }, [status]);
 
   function update(key, value) { setConfig((current) => ({ ...current, [key]: value })); }
+  function toggleCategory(categoryId) {
+    setConfig((current) => {
+      const selectedIds = new Set(current.category_ids || []);
+      if (selectedIds.has(categoryId)) selectedIds.delete(categoryId);
+      else selectedIds.add(categoryId);
+      return { ...current, category_ids: [...selectedIds] };
+    });
+  }
+  async function refreshDiscovery() {
+    setDiscovering(true);
+    try {
+      const value = await api("/api/discovery/refresh", {
+        method: "POST",
+        body: JSON.stringify({ base_url: config.base_url }),
+      });
+      setDiscovery(value);
+    } catch (error) { onError(error); } finally { setDiscovering(false); }
+  }
   const active = status?.state === "running" || status?.state === "stopping";
+  const selectedIds = new Set(config.category_ids || []);
+  const selectedCount = (discovery.categories || []).reduce((total, category) => total + (selectedIds.has(category.id) ? Number(category.count || 0) : 0), 0);
 
   return <main className="page">
     <header className="page-header"><div><h1>Crawl runs</h1><p>Configure, resume, and audit full or test catalog runs.</p></div><Button icon="play" tone="primary" disabled={active} onClick={() => onStart(config)}>Start new crawl</Button></header>
@@ -30,6 +53,27 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
         {["obey_robots", "enrich_html", "download_media", "resume_checkpoint"].map((key) => <label key={key}><input type="checkbox" checked={Boolean(config[key])} onChange={(event) => update(key, event.target.checked)} /><span>{key.split("_").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ")}</span></label>)}
       </div>
     </section>
+    <section className="catalog-discovery panel">
+      <div className="panel-header catalog-discovery__header">
+        <div><h2>Catalog discovery</h2><span>Count first, then choose which categories the product crawl may visit.</span></div>
+        <Button disabled={active || discovering} onClick={refreshDiscovery}>{discovering ? "Counting…" : "Count full catalog"}</Button>
+      </div>
+      {discovery.discovered_at ? <>
+        <div className="catalog-discovery__summary">
+          <div><small>Full catalog</small><strong>{formatNumber(discovery.total_products)}</strong><span>products</span></div>
+          <div><small>Categories found</small><strong>{formatNumber(discovery.total_categories)}</strong><span>categories</span></div>
+          <div><small>Selected scope</small><strong>{selectedIds.size ? formatNumber(selectedCount) : formatNumber(discovery.total_products)}</strong><span>{selectedIds.size ? "category assignments" : "all products"}</span></div>
+          <button type="button" disabled={!selectedIds.size} onClick={() => update("category_ids", [])}>Clear selection</button>
+        </div>
+        <div className="category-picker" aria-label="Catalog categories">
+          {(discovery.categories || []).map((category) => <label key={category.id}>
+            <input type="checkbox" checked={selectedIds.has(category.id)} onChange={() => toggleCategory(category.id)} />
+            <span><strong>{category.path || category.name}</strong><small>{formatNumber(category.count)} products</small></span>
+          </label>)}
+        </div>
+        <p className="catalog-discovery__note">Category counts can overlap. The crawler de-duplicates products assigned to more than one selected category.</p>
+      </> : <EmptyState icon="runs" title="Catalog not counted yet" body="Run discovery to get the full product total and category-level counts without downloading product details or images." />}
+    </section>
     <div className="runs-layout">
       <section className="panel panel--table"><div className="panel-header"><h2>Run history</h2><span>{runs.length} recorded runs</span></div>{runs.length ? <div className="table-scroll"><table><thead><tr><th>Started</th><th>State</th><th>Products</th><th>Variations</th><th>Images</th><th>Diagnostics</th><th>Checkpoint</th><th /></tr></thead><tbody>{runs.map((run) => { const counts = run.summary?.database_counts || {}; return <tr key={run.run_id} onClick={() => setSelected(run)} className="clickable-row"><td>{formatDate(run.started_at)}</td><td><StatusMark state={run.state || "unknown"} /></td><td>{formatNumber(counts.products)}</td><td>{formatNumber(counts.variations)}</td><td>{formatNumber(counts.images)}</td><td>{formatNumber(counts.diagnostics)}</td><td>{run.checkpoint_restored ? "Restored" : "Fresh"}</td><td><Icon name="chevron" /></td></tr>; })}</tbody></table></div> : <EmptyState icon="runs" title="No run history" body="Completed and interrupted runs persisted to S3 appear here." />}</section>
       <RunInspector run={selected} current={status} logs={logs} onStop={onStop} />
@@ -42,5 +86,5 @@ function RunInspector({ run, current, logs, onStop }) {
   const isCurrent = run.run_id === current?.run_id;
   const counts = (isCurrent ? current?.catalog : run.summary?.database_counts) || {};
   const config = run.config || {};
-  return <aside className="run-inspector"><header><div><h2>Run inspector</h2><small>{run.run_id}</small></div><StatusMark state={run.state || "unknown"} /></header><div className="run-inspector__body"><dl className="metadata-grid"><div><dt>Started</dt><dd>{formatDate(run.started_at)}</dd></div><div><dt>Finished</dt><dd>{formatDate(run.finished_at)}</dd></div><div><dt>Mode</dt><dd>{config.mode || "—"}</dd></div><div><dt>Limit</dt><dd>{config.max_products || "Full"}</dd></div></dl><section><h3>Data coverage</h3><div className="mini-coverage">{["products", "variations", "images", "diagnostics"].map((key) => <div key={key}><small>{key}</small><strong>{formatNumber(counts[key])}</strong></div>)}</div></section>{isCurrent && (run.state === "running" || run.state === "stopping") ? <Button icon="stop" tone="danger" onClick={onStop}>Stop run</Button> : null}<section><h3>Live log</h3><pre className="live-log">{isCurrent ? logs || "Waiting for crawler output…" : "Historical logs are included in the run export."}</pre></section></div></aside>;
+  return <aside className="run-inspector"><header><div><h2>Run inspector</h2><small>{run.run_id}</small></div><StatusMark state={run.state || "unknown"} /></header><div className="run-inspector__body"><dl className="metadata-grid"><div><dt>Started</dt><dd>{formatDate(run.started_at)}</dd></div><div><dt>Finished</dt><dd>{formatDate(run.finished_at)}</dd></div><div><dt>Mode</dt><dd>{config.mode || "—"}</dd></div><div><dt>Limit</dt><dd>{config.max_products || "Full"}</dd></div><div><dt>Categories</dt><dd>{config.category_ids?.length ? `${config.category_ids.length} selected` : "All"}</dd></div></dl><section><h3>Data coverage</h3><div className="mini-coverage">{["products", "variations", "images", "diagnostics"].map((key) => <div key={key}><small>{key}</small><strong>{formatNumber(counts[key])}</strong></div>)}</div></section>{isCurrent && (run.state === "running" || run.state === "stopping") ? <Button icon="stop" tone="danger" onClick={onStop}>Stop run</Button> : null}<section><h3>Live log</h3><pre className="live-log">{isCurrent ? logs || "Waiting for crawler output…" : "Historical logs are included in the run export."}</pre></section></div></aside>;
 }

@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from lgd_scraper.s3sync import load_json_object, save_json_object
+from lgd_scraper.s3sync import (
+    load_json_object,
+    presigned_media_url,
+    save_json_object,
+)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -22,6 +26,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "download_media": True,
     "resume_checkpoint": True,
     "obey_robots": True,
+    "category_ids": [],
 }
 
 
@@ -91,11 +96,21 @@ def secret_presence() -> dict[str, bool]:
 
 
 def storage_settings() -> dict[str, Any]:
+    configured_base = (os.getenv("S3_PUBLIC_BASE_URL") or "").rstrip("/")
+    public_base = configured_base if _valid_public_media_base(configured_base) else ""
     return {
         "bucket": os.getenv("S3_BUCKET") or "",
         "prefix": os.getenv("S3_PREFIX", "jewelry-product-scraper"),
         "region": os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "",
-        "public_media_url": os.getenv("S3_PUBLIC_BASE_URL") or "",
+        "public_media_url": public_base,
+        "media_delivery": (
+            "cdn"
+            if public_base
+            else "private_s3_signed"
+            if os.getenv("S3_BUCKET")
+            else "source"
+        ),
+        "public_media_url_ignored": bool(configured_base and not public_base),
         "endpoint_configured": bool(os.getenv("AWS_ENDPOINT_URL")),
     }
 
@@ -122,9 +137,21 @@ def _json(value: str | None, fallback: Any) -> Any:
 def public_media_url(media: dict[str, Any]) -> str:
     local_path = str(media.get("local_path") or "").lstrip("/")
     base = (os.getenv("S3_PUBLIC_BASE_URL") or "").rstrip("/")
-    if base and local_path:
+    if _valid_public_media_base(base) and local_path:
         return f"{base}/{local_path}"
+    if local_path:
+        signed = presigned_media_url(local_path)
+        if signed:
+            return signed
     return str(media.get("source_url") or "")
+
+
+def _valid_public_media_base(value: str) -> bool:
+    normalized = value.strip().lower()
+    return bool(
+        normalized.startswith(("https://", "http://"))
+        and "your-cdn-domain" not in normalized
+    )
 
 
 def quality_for(product: dict[str, Any]) -> dict[str, Any]:

@@ -101,7 +101,7 @@ Do not commit or paste secret values into source files.
 | `AWS_SECRET_ACCESS_KEY` | Yes | Matching IAM secret. |
 | `AWS_REGION` | Yes | Bucket region, such as `us-east-1`. |
 | `AWS_ENDPOINT_URL` | No | Custom S3-compatible endpoint for R2, B2, MinIO, and similar providers. |
-| `S3_PUBLIC_BASE_URL` | Recommended | Public CDN/base URL ending at the media prefix, used in the WooCommerce `Images` column. |
+| `S3_PUBLIC_BASE_URL` | Optional | Real public CDN/base URL ending at the media prefix, used in WooCommerce image columns. Never enter a placeholder URL. |
 | `WC_CONSUMER_KEY` | Recommended | Read-only WooCommerce REST API consumer key. |
 | `WC_CONSUMER_SECRET` | Recommended | Read-only WooCommerce REST API secret. |
 
@@ -112,7 +112,21 @@ are downloaded through a one-hour presigned URL.
 WooCommerce must be able to retrieve product images from direct online URLs.
 Prefer a CloudFront/CDN URL in `S3_PUBLIC_BASE_URL`. If the bucket is private and
 no public media URL is configured, the sheet retains the original source image
-URLs instead.
+URLs instead. The admin panel does not require a public bucket or CDN: it creates
+temporary signed S3 URLs for downloaded media.
+
+### Count first and crawl selected categories
+
+In **Crawl runs**, choose **Count full catalog**. This reads WooCommerce's total
+product header and category counts without downloading product pages or images.
+Select one or more categories and then start the crawl. Products assigned to
+overlapping selected categories are de-duplicated automatically.
+
+The equivalent command-line filter is:
+
+```bash
+scrapy crawl catalog -a category_ids=11,12
+```
 
 ## Safe first run
 

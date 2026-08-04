@@ -28,8 +28,10 @@ from lgd_scraper.admin_data import (
     secret_presence,
     storage_settings,
 )
+from lgd_scraper.discovery import CatalogDiscoveryError, discover_catalog
 from lgd_scraper.s3sync import (
     download_checkpoint,
+    load_json_object,
     list_admin_runs,
     presigned_artifact_url,
     save_json_object,
@@ -43,6 +45,7 @@ DATABASE_PATH = EXPORT_DIR / "catalog.sqlite"
 LOG_PATH = RUNTIME_DIR / "crawl.log"
 STATUS_PATH = RUNTIME_DIR / "status.json"
 SETTINGS_PATH = RUNTIME_DIR / "admin-settings.json"
+DISCOVERY_PATH = RUNTIME_DIR / "catalog-discovery.json"
 PROGRESS_PATH = EXPORT_DIR / "progress.json"
 ADMIN_DIST = PROJECT_DIR / "admin_dist"
 
@@ -78,6 +81,7 @@ class CrawlSettings(BaseModel):
     download_media: bool = True
     resume_checkpoint: bool = True
     obey_robots: bool = True
+    category_ids: list[str] = Field(default_factory=list, max_length=500)
 
 
 class StartRequest(BaseModel):
@@ -92,6 +96,11 @@ class StartRequest(BaseModel):
     download_media: bool | None = None
     resume_checkpoint: bool | None = None
     obey_robots: bool | None = None
+    category_ids: list[str] | None = Field(default=None, max_length=500)
+
+
+class DiscoveryRequest(BaseModel):
+    base_url: HttpUrl | None = None
 
 
 def _now() -> str:
@@ -181,6 +190,13 @@ def _merged_start_settings(request: StartRequest) -> dict[str, Any]:
     values.update(provided)
     if values["mode"] == "full":
         values["max_products"] = 0
+    values["category_ids"] = list(
+        dict.fromkeys(
+            str(value).strip()
+            for value in values.get("category_ids", [])
+            if str(value).strip()
+        )
+    )
     return CrawlSettings.model_validate(values).model_dump(mode="json")
 
 
@@ -330,6 +346,8 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
             "-a",
             f"max_products={config['max_products']}",
             "-a",
+            f"category_ids={','.join(config['category_ids'])}",
+            "-a",
             f"enrich_html={'true' if config['enrich_html'] else 'false'}",
             "-a",
             "use_playwright=false",
@@ -382,6 +400,41 @@ def stop_crawl() -> dict[str, str]:
 @app.get("/api/catalog/summary", dependencies=[Depends(_require_control)])
 def get_catalog_summary() -> dict[str, Any]:
     return catalog_summary(DATABASE_PATH)
+
+
+@app.get("/api/discovery", dependencies=[Depends(_require_control)])
+def get_discovery() -> dict[str, Any]:
+    value = _read_json(DISCOVERY_PATH)
+    if not isinstance(value, dict):
+        value = load_json_object("admin", "catalog-discovery.json")
+    return value if isinstance(value, dict) else {
+        "total_products": 0,
+        "total_categories": 0,
+        "categories": [],
+        "discovered_at": None,
+    }
+
+
+@app.post("/api/discovery/refresh", dependencies=[Depends(_require_control)])
+def refresh_discovery(request: DiscoveryRequest) -> dict[str, Any]:
+    settings = effective_settings(SETTINGS_PATH)
+    base_url = str(request.base_url or settings["base_url"])
+    try:
+        value = discover_catalog(
+            base_url,
+            consumer_key=os.getenv("WC_CONSUMER_KEY"),
+            consumer_secret=os.getenv("WC_CONSUMER_SECRET"),
+        )
+    except CatalogDiscoveryError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    DISCOVERY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = DISCOVERY_PATH.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(DISCOVERY_PATH)
+    save_json_object(value, "admin", "catalog-discovery.json")
+    return value
 
 
 @app.get("/api/products", dependencies=[Depends(_require_control)])

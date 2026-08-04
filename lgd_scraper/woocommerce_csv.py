@@ -108,7 +108,12 @@ def _raw_api(product: dict[str, Any]) -> dict[str, Any]:
 
 def _media_url(media: dict[str, Any], public_base_url: str | None) -> str:
     local_path = str(media.get("local_path") or "").lstrip("/")
-    if local_path and public_base_url:
+    normalized_base = str(public_base_url or "").strip().lower()
+    valid_public_base = bool(
+        normalized_base.startswith(("https://", "http://"))
+        and "your-cdn-domain" not in normalized_base
+    )
+    if local_path and valid_public_base:
         return f"{public_base_url.rstrip('/')}/{local_path}"
     return str(media.get("source_url") or "")
 

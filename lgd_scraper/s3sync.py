@@ -153,6 +153,31 @@ def presigned_artifact_url(expires_in: int = 3600) -> str | None:
         return None
 
 
+def presigned_media_url(local_path: str, expires_in: int = 3600) -> str | None:
+    """Return a temporary URL for a private media object stored by Scrapy."""
+
+    normalized = str(local_path or "").replace("\\", "/").lstrip("/")
+    if (
+        not s3_enabled()
+        or not normalized
+        or normalized.startswith(("http://", "https://"))
+        or ".." in normalized.split("/")
+    ):
+        return None
+    try:
+        return s3_client().generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": os.environ["S3_BUCKET"],
+                "Key": _key("media", normalized),
+            },
+            ExpiresIn=expires_in,
+        )
+    except Exception as exc:
+        LOGGER.warning("Could not create media URL for %s: %s", normalized, exc)
+        return None
+
+
 def upload_final_artifacts(output_dir: Path) -> None:
     """Upload a completed writer output after SQLite and CSV handles are closed."""
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+from urllib.parse import parse_qs, urlparse
 
 from scrapy.http import HtmlResponse, Request
 
@@ -45,6 +46,53 @@ def test_store_api_product_normalization_converts_minor_units():
     assert product["currency"] == "USD"
     assert product["type"] == "variable"
     assert product["media"][0]["source_url"].endswith("/ring.jpg")
+
+
+def test_selected_categories_are_sent_to_store_api_and_products_are_deduplicated():
+    spider = WooCommerceCatalogSpider(
+        base_url="https://example.test/",
+        category_ids="11,12,11",
+        enrich_html=False,
+    )
+    requests = list(spider.start_requests())
+    products_request = next(
+        request for request in requests if request.callback == spider.parse_products_api
+    )
+    query = parse_qs(urlparse(products_request.url).query)
+
+    assert spider.category_ids == ["11", "12"]
+    assert query["category"] == ["11,12"]
+    assert query["category_operator"] == ["in"]
+
+    raw = {
+        "id": 42,
+        "name": "Ring",
+        "permalink": "https://example.test/product/ring/",
+        "prices": {"price": "100", "currency_minor_unit": 2},
+    }
+    first_request = Request(
+        products_request.url,
+        meta={"api_kind": "store", "page": 1},
+    )
+    first_response = HtmlResponse(
+        url=first_request.url,
+        body=json.dumps([raw]).encode(),
+        encoding="utf-8",
+        request=first_request,
+    )
+    duplicate_request = Request(
+        products_request.url,
+        meta={"api_kind": "store", "page": 1},
+    )
+    duplicate_response = HtmlResponse(
+        url=duplicate_request.url,
+        body=json.dumps([raw]).encode(),
+        encoding="utf-8",
+        request=duplicate_request,
+    )
+
+    assert len([item for item in spider.parse_products_api(first_response) if isinstance(item, dict) and item.get("_record_type") == "product"]) == 1
+    assert len([item for item in spider.parse_products_api(duplicate_response) if isinstance(item, dict) and item.get("_record_type") == "product"]) == 0
 
 
 def test_product_page_extracts_variations_attributes_categories_and_images():

@@ -4,7 +4,18 @@ import csv
 import json
 import sqlite3
 
-from lgd_scraper.woocommerce_csv import export_woocommerce_csvs
+from lgd_scraper.woocommerce_csv import _media_url, export_woocommerce_csvs
+
+
+def test_placeholder_cdn_is_not_written_to_woocommerce_images():
+    media = {
+        "local_path": "products/99/ring.jpg",
+        "source_url": "https://source.test/ring.jpg",
+    }
+
+    assert _media_url(
+        media, "https://your-cdn-domain/jewelry-product-scraper/media"
+    ) == "https://source.test/ring.jpg"
 
 
 def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):

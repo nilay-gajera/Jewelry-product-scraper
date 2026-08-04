@@ -44,6 +44,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         enrich_html: str | bool = True,
         consumer_key: str | None = None,
         consumer_secret: str | None = None,
+        category_ids: str | Iterable[str] = "",
         *args,
         **kwargs,
     ):
@@ -56,6 +57,17 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         self.consumer_key = consumer_key or os.getenv("WC_CONSUMER_KEY")
         self.consumer_secret = consumer_secret or os.getenv("WC_CONSUMER_SECRET")
         self.authenticated = bool(self.consumer_key and self.consumer_secret)
+        if isinstance(category_ids, str):
+            raw_category_ids = category_ids.split(",")
+        else:
+            raw_category_ids = category_ids
+        self.category_ids = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in raw_category_ids
+                if str(value).strip()
+            )
+        )
         self.allowed_domains = [urlparse(self.base_url).hostname or ""]
 
         self.products_scheduled = 0
@@ -63,6 +75,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         self.second_sitemap_attempted = False
         self.access_blocked = False
         self.block_reason: str | None = None
+        self.seen_product_ids: set[str] = set()
 
         if self.authenticated:
             raw = f"{self.consumer_key}:{self.consumer_secret}".encode("utf-8")
@@ -76,11 +89,18 @@ class WooCommerceCatalogSpider(scrapy.Spider):
 
     def start_requests(self):
         if self.authenticated:
-            yield self._api_request(
-                self._url("wp-json/wc/v3/products", per_page=100, page=1),
-                self.parse_products_api,
-                meta={"api_kind": "rest", "page": 1},
-            )
+            product_categories = self.category_ids or [None]
+            for category_id in product_categories:
+                yield self._api_request(
+                    self._url(
+                        "wp-json/wc/v3/products",
+                        per_page=100,
+                        page=1,
+                        category=category_id,
+                    ),
+                    self.parse_products_api,
+                    meta={"api_kind": "rest", "page": 1},
+                )
             yield self._api_request(
                 self._url("wp-json/wc/v3/products/categories", per_page=100, page=1),
                 self.parse_categories_api,
@@ -93,7 +113,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             )
         else:
             yield self._api_request(
-                self._url("wp-json/wc/store/v1/products", per_page=100, page=1),
+                self._url(
+                    "wp-json/wc/store/v1/products",
+                    per_page=100,
+                    page=1,
+                    category=",".join(self.category_ids) or None,
+                    category_operator="in" if self.category_ids else None,
+                ),
                 self.parse_products_api,
                 meta={"api_kind": "store", "page": 1},
             )
@@ -115,7 +141,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             yield self._diagnostic_for_response(
                 response, "products_api_unavailable", "Product API was not accessible."
             )
-            if not self.fallback_started:
+            if not self.fallback_started and not self.category_ids:
                 self.fallback_started = True
                 yield Request(
                     urljoin(self.base_url, "wp-sitemap.xml"),
@@ -128,6 +154,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         for raw_product in payload:
             if self.max_products and self.products_scheduled >= self.max_products:
                 break
+            product_id = str(raw_product.get("id") or "")
+            if product_id and product_id in self.seen_product_ids:
+                continue
+            if product_id:
+                self.seen_product_ids.add(product_id)
             self.products_scheduled += 1
             product = self._normalize_product(raw_product, api_kind)
 
@@ -1376,6 +1407,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             request.meta.get("api_kind")
             and "products?" in request.url
             and not self.fallback_started
+            and not self.category_ids
         ):
             self.fallback_started = True
             yield Request(
