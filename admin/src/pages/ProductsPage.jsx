@@ -73,7 +73,7 @@ function ProductInspector({ product, onClose }) {
 
   return (
     <aside className="product-inspector">
-      <header><div><h2>{product?.name || "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></header>
+      <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></header>
       {!product ? <LoadingLine /> : <>
         <div className="inspector-hero">{featured ? <img src={featured.display_url || featured.source_url} alt={featured.alt || product.name || "Product"} /> : <span><Icon name="image" size={38} /></span>}</div>
         <div className="media-rail">{media.slice(0, 8).map((item, index) => <img key={`${item.source_url}-${index}`} src={item.display_url || item.source_url} alt={item.alt || ""} loading="lazy" />)}{media.length > 8 ? <span>+{media.length - 8}</span> : null}</div>

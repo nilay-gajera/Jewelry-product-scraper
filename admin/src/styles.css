@@ -206,9 +206,9 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
 
 .settings-layout { display: grid; grid-template-columns: 190px minmax(0, 920px); gap: 22px; align-items: start; }
 .settings-nav { position: sticky; top: 20px; display: grid; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-.settings-nav a { padding: 11px 13px; color: #465158; border-bottom: 1px solid var(--border); font-size: .72rem; text-decoration: none; }
-.settings-nav a:last-child { border-bottom: 0; }
-.settings-nav a:hover { color: var(--emerald); background: var(--emerald-pale); }
+.settings-nav button { padding: 11px 13px; color: #465158; background: #fff; border: 0; border-bottom: 1px solid var(--border); font-size: .72rem; text-align: left; cursor: pointer; }
+.settings-nav button:last-child { border-bottom: 0; }
+.settings-nav button:hover { color: var(--emerald); background: var(--emerald-pale); }
 .settings-form { display: grid; gap: 14px; }
 .settings-form > section { padding: 18px; border: 1px solid var(--border); border-radius: var(--radius); scroll-margin-top: 20px; }
 .settings-form > section > p { margin: 6px 0 17px; font-size: .74rem; }
@@ -264,7 +264,7 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
   .page-header { align-items: center; }
   .overview-lower, .settings-layout { grid-template-columns: 1fr; }
   .settings-nav { position: static; grid-template-columns: repeat(4, 1fr); }
-  .settings-nav a { border-bottom: 0; border-right: 1px solid var(--border); text-align: center; }
+  .settings-nav button { border-bottom: 0; border-right: 1px solid var(--border); text-align: center; }
   .product-layout--detail { display: block; }
   .product-layout--detail .product-list-panel { display: none; }
   .product-inspector { min-height: 70vh; }
@@ -289,7 +289,7 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
   .run-config__grid, .form-grid { grid-template-columns: 1fr; }
   .toggle-row--stacked { grid-template-columns: 1fr; }
   .settings-nav { display: flex; overflow-x: auto; }
-  .settings-nav a { flex: 0 0 auto; }
+  .settings-nav button { flex: 0 0 auto; }
   .media-grid { grid-template-columns: repeat(2, 1fr); }
   .mini-coverage { grid-template-columns: repeat(2, 1fr); }
   .toast { left: 12px; right: 12px; top: 60px; }
