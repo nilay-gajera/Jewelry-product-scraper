@@ -138,10 +138,15 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
 .product-list-panel { min-width: 0; }
 .product-layout--detail .product-list-panel { border-right: 1px solid var(--border); }
 .product-toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 160px; gap: 9px; padding: 12px; border-bottom: 1px solid var(--border); }
+.product-toolbar__bulk { grid-column: 1 / -1; min-height: 42px; display: flex; align-items: center; justify-content: flex-end; gap: 12px; padding: 7px 9px; color: #465158; background: #fff8f8; border: 1px solid #efced1; border-radius: 7px; font-size: .7rem; }
+.product-toolbar__bulk span { margin-right: auto; }
+.product-toolbar__bulk button:not(.button) { padding: 5px 0; color: var(--muted); background: none; border: 0; font-size: .67rem; text-decoration: underline; cursor: pointer; }
 .search-control, .select-control { position: relative; display: flex; align-items: center; }
 .search-control svg, .select-control svg { position: absolute; left: 11px; color: #68747a; pointer-events: none; }
 .search-control input, .select-control select { padding-left: 36px; }
-.products-table th:first-child { min-width: 250px; }
+.products-table th:nth-child(2) { min-width: 250px; }
+.products-table .product-select { width: 42px; min-width: 42px; padding-right: 5px; text-align: center; }
+.product-select input { width: 15px; height: 15px; accent-color: var(--emerald); cursor: pointer; }
 .pagination { min-height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; color: var(--muted); font-size: .7rem; border-top: 1px solid var(--border); }
 .pagination div { display: flex; align-items: center; gap: 6px; }
 .pagination button, .pagination strong { width: 30px; height: 30px; display: grid; place-items: center; background: #fff; border: 1px solid var(--border); border-radius: 5px; }
@@ -321,6 +326,7 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
   .coverage-item { flex: 0 0 145px; border-bottom: 0 !important; }
   .overview-lower { grid-template-columns: 1fr; }
   .product-toolbar { grid-template-columns: 1fr; }
+  .product-toolbar__bulk { flex-wrap: wrap; }
   .products-table th:nth-child(n+3):not(:last-child), .products-table td:nth-child(n+3):not(:last-child) { display: none; }
   .product-cell { min-width: 0; }
   .run-config__grid, .form-grid { grid-template-columns: 1fr; }

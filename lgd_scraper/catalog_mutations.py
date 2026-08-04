@@ -74,28 +74,43 @@ def copy_database(source_path: Path, destination_path: Path) -> None:
         source.close()
 
 
-def delete_product(database_path: Path, product_id: str) -> dict[str, Any] | None:
-    """Delete one product and its normalized relationships transactionally."""
+def delete_products(
+    database_path: Path, product_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Delete products and their normalized relationships in one transaction."""
+
+    requested_ids = list(
+        dict.fromkeys(
+            str(product_id).strip()
+            for product_id in product_ids
+            if str(product_id).strip()
+        )
+    )
+    if not requested_ids:
+        return []
+    if len(requested_ids) > 500:
+        raise ValueError("A maximum of 500 products can be deleted at once.")
 
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
     try:
-        row = connection.execute(
-            "SELECT raw_json FROM products WHERE id = ?", (product_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        try:
-            product = json.loads(row["raw_json"])
-        except (json.JSONDecodeError, TypeError):
-            product = {}
-        media_paths = list(
-            dict.fromkeys(
-                str(item.get("local_path"))
-                for item in product.get("media") or []
-                if item.get("local_path")
-            )
-        )
+        placeholders = ", ".join("?" for _ in requested_ids)
+        rows = connection.execute(
+            f"SELECT id, raw_json FROM products WHERE id IN ({placeholders})",
+            requested_ids,
+        ).fetchall()
+        products: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                product = json.loads(row["raw_json"])
+            except (json.JSONDecodeError, TypeError):
+                product = {}
+            products[str(row["id"])] = product
+        found_ids = [product_id for product_id in requested_ids if product_id in products]
+        if not found_ids:
+            return []
+
+        found_placeholders = ", ".join("?" for _ in found_ids)
         table_names = {
             item[0]
             for item in connection.execute(
@@ -111,16 +126,40 @@ def delete_product(database_path: Path, product_id: str) -> dict[str, Any] | Non
             ):
                 if table in table_names:
                     connection.execute(
-                        f"DELETE FROM {table} WHERE product_id = ?", (product_id,)
+                        f"DELETE FROM {table} WHERE product_id IN ({found_placeholders})",
+                        found_ids,
                     )
-            connection.execute("DELETE FROM products WHERE id = ?", (product_id,))
-        return {
-            "id": product_id,
-            "name": product.get("name") or product_id,
-            "media_paths": media_paths,
-        }
+            connection.execute(
+                f"DELETE FROM products WHERE id IN ({found_placeholders})", found_ids
+            )
+
+        deleted = []
+        for product_id in found_ids:
+            product = products[product_id]
+            media_paths = list(
+                dict.fromkeys(
+                    str(item.get("local_path"))
+                    for item in product.get("media") or []
+                    if item.get("local_path")
+                )
+            )
+            deleted.append(
+                {
+                    "id": product_id,
+                    "name": product.get("name") or product_id,
+                    "media_paths": media_paths,
+                }
+            )
+        return deleted
     finally:
         connection.close()
+
+
+def delete_product(database_path: Path, product_id: str) -> dict[str, Any] | None:
+    """Delete one product and its normalized relationships transactionally."""
+
+    deleted = delete_products(database_path, [product_id])
+    return deleted[0] if deleted else None
 
 
 def write_normalized_csvs(

@@ -134,10 +134,12 @@ scrapy crawl catalog -a category_ids=11,12
 
 ### Delete products
 
-Open a product in **Products** and select the trash button. Deletion removes the
-parent, variations, image records, and category/attribute assignments from the
-active catalog. The service replaces the S3 checkpoint and latest import files
-before reporting success, so the product does not return after a Render restart.
+Open a product in **Products** and select the trash button, or use the row
+checkboxes and **Delete selected** to remove up to 500 products in one batch.
+Deletion removes each parent, its variations, image records, and
+category/attribute assignments from the active catalog. A batch replaces the S3
+checkpoint and latest import files once before reporting success, so deleted
+products do not return after a Render restart.
 
 Downloaded S3 media is retained by default. Select **Also delete downloaded media
 from S3** when those objects should be removed too. Historical `runs/` archives

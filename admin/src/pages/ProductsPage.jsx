@@ -15,6 +15,10 @@ export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
   const [detail, setDetail] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
+  const [bulkDeleteMedia, setBulkDeleteMedia] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -37,14 +41,68 @@ export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
   }, [selectedId, onError]);
 
   const pages = Math.max(1, Math.ceil(data.total / data.page_size));
+  const visibleIds = useMemo(() => data.items.map((product) => String(product.id)), [data.items]);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+
+  function toggleProduct(productId) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(productId)) next.delete(productId);
+      else next.add(productId);
+      return next;
+    });
+  }
+
+  function toggleVisibleProducts() {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allVisibleSelected) visibleIds.forEach((id) => next.delete(id));
+      else visibleIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }
 
   async function deleteSelectedProduct(deleteMedia) {
     if (!detail?.id) return;
     const result = await api(`/api/products/${encodeURIComponent(detail.id)}?delete_media=${deleteMedia ? "true" : "false"}`, { method: "DELETE" });
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      next.delete(String(detail.id));
+      return next;
+    });
     setSelectedId("");
     setDetail(null);
     setRefreshKey((value) => value + 1);
     onDeleted?.(result);
+  }
+
+  async function deleteSelectedProducts() {
+    const productIds = [...selectedIds];
+    if (!productIds.length) return;
+    setBulkDeleting(true);
+    try {
+      const result = await api("/api/products/bulk-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_ids: productIds, delete_media: bulkDeleteMedia }),
+      });
+      if (selectedId && productIds.includes(String(selectedId))) {
+        setSelectedId("");
+        setDetail(null);
+      }
+      const remainingTotal = Math.max(0, data.total - result.deleted_count);
+      const remainingPages = Math.max(1, Math.ceil(remainingTotal / data.page_size));
+      setPage((current) => Math.min(current, remainingPages));
+      setSelectedIds(new Set());
+      setConfirmingBulkDelete(false);
+      setBulkDeleteMedia(false);
+      setRefreshKey((value) => value + 1);
+      onDeleted?.(result);
+    } catch (error) {
+      onError(error);
+    } finally {
+      setBulkDeleting(false);
+    }
   }
 
   return (
@@ -53,17 +111,19 @@ export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
       <div className={detail ? "product-layout product-layout--detail" : "product-layout"}>
         <section className="product-list-panel">
           <div className="product-toolbar">
-            <label className="search-control"><Icon name="search" /><input placeholder="Search by name, SKU, or source ID…" value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} /></label>
-            <label className="select-control"><Icon name="filter" /><select value={type} onChange={(event) => { setType(event.target.value); setPage(1); }}><option value="">All types</option><option value="simple">Simple</option><option value="variable">Variable</option><option value="variation">Variation</option></select></label>
+            <label className="search-control"><Icon name="search" /><input placeholder="Search by name, SKU, or source ID…" value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); setSelectedIds(new Set()); }} /></label>
+            <label className="select-control"><Icon name="filter" /><select value={type} onChange={(event) => { setType(event.target.value); setPage(1); setSelectedIds(new Set()); }}><option value="">All types</option><option value="simple">Simple</option><option value="variable">Variable</option><option value="variation">Variation</option></select></label>
+            {selectedIds.size ? <div className="product-toolbar__bulk"><span><strong>{selectedIds.size}</strong> product{selectedIds.size === 1 ? "" : "s"} selected</span><button onClick={() => setSelectedIds(new Set())}>Clear selection</button><Button icon="trash" tone="danger" onClick={() => setConfirmingBulkDelete(true)}>Delete selected</Button></div> : null}
           </div>
           {loading ? <LoadingLine /> : null}
-          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th>Product</th><th>Type</th><th>Variations</th><th>Images</th><th>Categories</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
-            {data.items.map((product) => <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>)}
+          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th className="product-select"><input type="checkbox" checked={allVisibleSelected} onChange={toggleVisibleProducts} aria-label="Select all products on this page" /></th><th>Product</th><th>Type</th><th>Variations</th><th>Images</th><th>Categories</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
+            {data.items.map((product) => { const productId = String(product.id); return <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td className="product-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedIds.has(productId)} onChange={() => toggleProduct(productId)} aria-label={`Select ${product.name || product.id}`} /></td><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>; })}
           </tbody></table></div> : <EmptyState title="No matching products" body="Change the filter or run the scraper to populate products." />}
           <footer className="pagination"><span>{data.total ? `${(page - 1) * data.page_size + 1}–${Math.min(page * data.page_size, data.total)} of ${data.total}` : "0 products"}</span><div><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)} aria-label="Previous page"><Icon name="chevron" className="icon-reverse" /></button><strong>{page}</strong><button disabled={page >= pages} onClick={() => setPage((value) => value + 1)} aria-label="Next page"><Icon name="chevron" /></button></div></footer>
         </section>
         {selectedId ? <ProductInspector product={detail} onClose={() => setSelectedId("")} onDelete={deleteSelectedProduct} onError={onError} /> : null}
       </div>
+      {confirmingBulkDelete ? <DeleteDialog count={selectedIds.size} deleteMedia={bulkDeleteMedia} setDeleteMedia={setBulkDeleteMedia} busy={bulkDeleting} onCancel={() => setConfirmingBulkDelete(false)} onConfirm={deleteSelectedProducts} /> : null}
     </main>
   );
 }
@@ -108,9 +168,14 @@ function ProductInspector({ product, onClose, onDelete, onError }) {
         {tab === "media" ? <MediaGrid media={productMedia} /> : null}
         {tab === "raw" ? <pre className="raw-data">{JSON.stringify(product, null, 2)}</pre> : null}
       </>}
-      {confirmingDelete ? <div className="dialog-backdrop"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-product-title"><div className="confirm-dialog__icon"><Icon name="trash" size={22} /></div><h2 id="delete-product-title">Delete this product?</h2><p><strong>{product?.name || product?.id}</strong> and all of its variations and assignments will be removed from the active catalog and S3 checkpoint.</p><label className="delete-media-option"><input type="checkbox" checked={deleteMedia} onChange={(event) => setDeleteMedia(event.target.checked)} /><span><strong>Also delete downloaded media from S3</strong><small>Historical run archives are kept for recovery.</small></span></label><footer><Button disabled={deleting} onClick={() => setConfirmingDelete(false)}>Cancel</Button><Button icon="trash" tone="danger" disabled={deleting} onClick={confirmDelete}>{deleting ? "Deleting…" : "Delete product"}</Button></footer></section></div> : null}
+      {confirmingDelete ? <DeleteDialog productName={product?.name || product?.id} count={1} deleteMedia={deleteMedia} setDeleteMedia={setDeleteMedia} busy={deleting} onCancel={() => setConfirmingDelete(false)} onConfirm={confirmDelete} /> : null}
     </aside>
   );
+}
+
+function DeleteDialog({ productName, count, deleteMedia, setDeleteMedia, busy, onCancel, onConfirm }) {
+  const bulk = count > 1;
+  return <div className="dialog-backdrop"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-product-title"><div className="confirm-dialog__icon"><Icon name="trash" size={22} /></div><h2 id="delete-product-title">Delete {bulk ? `${count} products` : "this product"}?</h2><p>{bulk ? <><strong>{count} selected products</strong> and all of their variations and assignments</> : <><strong>{productName}</strong> and all of its variations and assignments</>} will be removed from the active catalog and S3 checkpoint.</p><label className="delete-media-option"><input type="checkbox" checked={deleteMedia} onChange={(event) => setDeleteMedia(event.target.checked)} /><span><strong>Also delete downloaded media from S3</strong><small>Historical run archives are kept for recovery.</small></span></label><footer><Button disabled={busy} onClick={onCancel}>Cancel</Button><Button icon="trash" tone="danger" disabled={busy} onClick={onConfirm}>{busy ? "Deleting…" : bulk ? `Delete ${count} products` : "Delete product"}</Button></footer></section></div>;
 }
 
 function Overview({ product }) {

@@ -33,7 +33,7 @@ from lgd_scraper.admin_data import (
 )
 from lgd_scraper.catalog_mutations import (
     copy_database,
-    delete_product,
+    delete_products,
     rebuild_catalog_artifacts,
 )
 from lgd_scraper.discovery import CatalogDiscoveryError, discover_catalog
@@ -89,9 +89,22 @@ def _graceful_shutdown_crawl() -> None:
         current.wait(timeout=10)
 
 
+def _force_stop_after_timeout(
+    current_process: subprocess.Popen[str], timeout: int = 45
+) -> None:
+    """Force-kill a crawl that does not finish its graceful shutdown."""
+
+    try:
+        current_process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if current_process.poll() is None:
+            current_process.kill()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await asyncio.to_thread(_restore_runtime_checkpoint)
+    await asyncio.to_thread(_recover_stale_process_state)
     try:
         yield
     finally:
@@ -146,6 +159,11 @@ class DiscoveryRequest(BaseModel):
     base_url: HttpUrl | None = None
 
 
+class BulkDeleteRequest(BaseModel):
+    product_ids: list[str] = Field(min_length=1, max_length=500)
+    delete_media: bool = False
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -183,7 +201,12 @@ def _read_state() -> dict[str, Any]:
         state = _default_state()
     if state.get("state") == "running" and not _process_running():
         state["state"] = "interrupted"
+        state["finished_at"] = state.get("finished_at") or _now()
         state["message"] = "The process stopped. Start again to resume from S3."
+    elif state.get("state") == "stopping" and not _process_running():
+        state["state"] = "stopped"
+        state["finished_at"] = state.get("finished_at") or _now()
+        state["message"] = "Crawl stopped. The latest completed checkpoint remains available."
     return state
 
 
@@ -214,6 +237,25 @@ def _persist_run(state: dict[str, Any]) -> None:
         )
     }
     save_json_object(payload, "admin", "runs", f"{run_id}.json")
+
+
+def _recover_stale_process_state() -> dict[str, Any]:
+    """Persist recovery from a Render restart or an orphaned stopping state."""
+
+    with state_lock:
+        original = _read_json(STATUS_PATH)
+        state = _read_state()
+        if isinstance(original, dict) and original.get("state") in {
+            "running",
+            "stopping",
+        } and state.get("state") not in {"running", "stopping"}:
+            _write_state(state)
+            try:
+                _persist_run(state)
+            except Exception:
+                # Local recovery must not prevent the service from starting if S3 is down.
+                pass
+        return state
 
 
 def _require_control(authorization: str | None = Header(default=None)) -> None:
@@ -299,18 +341,28 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
         state = _read_state()
         if state.get("run_id") != run_id:
             return
+        requested_stop = state.get("state") in {"stopping", "stopped"}
+        final_state = (
+            "failed"
+            if upload_error
+            else "stopped"
+            if requested_stop
+            else "completed_with_warnings"
+            if successful and access_warning
+            else "completed"
+            if successful
+            else "failed"
+        )
         state.update(
             {
-                "state": (
-                    "completed_with_warnings"
-                    if successful and access_warning
-                    else "completed" if successful else "failed"
-                ),
+                "state": final_state,
                 "finished_at": _now(),
                 "exit_code": exit_code,
                 "summary": summary,
                 "message": (
-                    "Crawl completed, but the source blocked one or more requests. Review diagnostics before importing."
+                    "Crawl stopped. Partial catalog data was checkpointed."
+                    if final_state == "stopped"
+                    else "Crawl completed, but the source blocked one or more requests. Review diagnostics before importing."
                     if successful and access_warning
                     else "Crawl completed. Review products or download the export."
                     if successful
@@ -427,16 +479,28 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
 
 @app.post("/api/stop", dependencies=[Depends(_require_control)])
 def stop_crawl() -> dict[str, str]:
-    if not _process_running():
-        return {"status": "not-running"}
-    assert process is not None
-    process.terminate()
     with state_lock:
+        if not _process_running():
+            state = _read_state()
+            if state.get("state") in {"stopped", "interrupted"}:
+                _write_state(state)
+                try:
+                    _persist_run(state)
+                except Exception:
+                    pass
+                return {"status": str(state["state"])}
+            return {"status": "not-running"}
+        assert process is not None
+        current_process = process
         state = _read_state()
         state["state"] = "stopping"
         state["message"] = "Stopping gracefully; partial data will be checkpointed."
         _write_state(state)
         _persist_run(state)
+    current_process.terminate()
+    threading.Thread(
+        target=_force_stop_after_timeout, args=(current_process,), daemon=True
+    ).start()
     return {"status": "stopping"}
 
 
@@ -499,6 +563,95 @@ def get_products(
     )
 
 
+def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, Any]:
+    """Durably remove products from the active catalog and mutable S3 objects."""
+
+    requested_ids = list(
+        dict.fromkeys(
+            str(product_id).strip()
+            for product_id in product_ids
+            if str(product_id).strip()
+        )
+    )
+    if not requested_ids:
+        raise HTTPException(422, "Select at least one product to delete.")
+    if not DATABASE_PATH.exists():
+        raise HTTPException(404, "No catalog database is available.")
+
+    with tempfile.TemporaryDirectory(prefix="catalog-delete-") as temp_dir:
+        candidate = Path(temp_dir) / "catalog.sqlite"
+        copy_database(DATABASE_PATH, candidate)
+        deleted_products = delete_products(candidate, requested_ids)
+        if not deleted_products:
+            raise HTTPException(404, "None of the selected products were found.")
+        try:
+            checkpoint_updated = upload_database_checkpoint(candidate)
+        except Exception as exc:
+            raise HTTPException(
+                502,
+                "The products were not deleted because the S3 checkpoint could not be updated.",
+            ) from exc
+
+        DATABASE_PATH.with_name(f"{DATABASE_PATH.name}-wal").unlink(missing_ok=True)
+        DATABASE_PATH.with_name(f"{DATABASE_PATH.name}-shm").unlink(missing_ok=True)
+        candidate.replace(DATABASE_PATH)
+
+    artifact_summary = rebuild_catalog_artifacts(DATABASE_PATH, EXPORT_DIR)
+    latest_artifacts_updated = False
+    artifact_error = None
+    try:
+        latest_artifacts_updated = upload_latest_artifacts(EXPORT_DIR)
+    except Exception as exc:
+        artifact_error = str(exc)
+
+    media_deleted = 0
+    media_error = None
+    media_paths = list(
+        dict.fromkeys(
+            path
+            for deleted in deleted_products
+            for path in deleted["media_paths"]
+        )
+    )
+    if delete_media:
+        try:
+            media_deleted = delete_media_objects(media_paths)
+        except Exception as exc:
+            media_error = str(exc)
+
+    deleted_ids = [deleted["id"] for deleted in deleted_products]
+    deleted_id_set = set(deleted_ids)
+    return {
+        "deleted": True,
+        "deleted_count": len(deleted_products),
+        "product_ids": deleted_ids,
+        "product_names": [deleted["name"] for deleted in deleted_products],
+        "not_found_ids": [
+            product_id for product_id in requested_ids if product_id not in deleted_id_set
+        ],
+        "checkpoint_updated": checkpoint_updated,
+        "latest_artifacts_updated": latest_artifacts_updated,
+        "media_requested": delete_media,
+        "media_deleted": media_deleted,
+        "media_error": media_error,
+        "artifact_error": artifact_error,
+        "catalog": artifact_summary["database_counts"],
+        "historical_runs_preserved": True,
+    }
+
+
+@app.post(
+    "/api/products/bulk-delete", dependencies=[Depends(_require_control)]
+)
+def remove_products(request: BulkDeleteRequest) -> dict[str, Any]:
+    """Delete up to 500 selected products with one durable checkpoint update."""
+
+    with state_lock:
+        if _process_running():
+            raise HTTPException(409, "Stop the active crawl before deleting products.")
+        return _remove_products(request.product_ids, request.delete_media)
+
+
 @app.get("/api/products/{product_id}", dependencies=[Depends(_require_control)])
 def get_product(product_id: str) -> dict[str, Any]:
     value = product_detail(DATABASE_PATH, product_id)
@@ -517,56 +670,10 @@ def remove_product(
     with state_lock:
         if _process_running():
             raise HTTPException(409, "Stop the active crawl before deleting products.")
-        if not DATABASE_PATH.exists():
-            raise HTTPException(404, "No catalog database is available.")
-
-        with tempfile.TemporaryDirectory(prefix="catalog-delete-") as temp_dir:
-            candidate = Path(temp_dir) / "catalog.sqlite"
-            copy_database(DATABASE_PATH, candidate)
-            deleted = delete_product(candidate, product_id)
-            if deleted is None:
-                raise HTTPException(404, "Product not found.")
-            try:
-                checkpoint_updated = upload_database_checkpoint(candidate)
-            except Exception as exc:
-                raise HTTPException(
-                    502,
-                    "The product was not deleted because the S3 checkpoint could not be updated.",
-                ) from exc
-
-            DATABASE_PATH.with_name(f"{DATABASE_PATH.name}-wal").unlink(missing_ok=True)
-            DATABASE_PATH.with_name(f"{DATABASE_PATH.name}-shm").unlink(missing_ok=True)
-            candidate.replace(DATABASE_PATH)
-
-        artifact_summary = rebuild_catalog_artifacts(DATABASE_PATH, EXPORT_DIR)
-        latest_artifacts_updated = False
-        artifact_error = None
-        try:
-            latest_artifacts_updated = upload_latest_artifacts(EXPORT_DIR)
-        except Exception as exc:
-            artifact_error = str(exc)
-
-        media_deleted = 0
-        media_error = None
-        if delete_media:
-            try:
-                media_deleted = delete_media_objects(deleted["media_paths"])
-            except Exception as exc:
-                media_error = str(exc)
-
-    return {
-        "deleted": True,
-        "product_id": deleted["id"],
-        "product_name": deleted["name"],
-        "checkpoint_updated": checkpoint_updated,
-        "latest_artifacts_updated": latest_artifacts_updated,
-        "media_requested": delete_media,
-        "media_deleted": media_deleted,
-        "media_error": media_error,
-        "artifact_error": artifact_error,
-        "catalog": artifact_summary["database_counts"],
-        "historical_runs_preserved": True,
-    }
+        result = _remove_products([product_id], delete_media)
+    result["product_id"] = result["product_ids"][0]
+    result["product_name"] = result["product_names"][0]
+    return result
 
 
 @app.get("/api/diagnostics", dependencies=[Depends(_require_control)])
