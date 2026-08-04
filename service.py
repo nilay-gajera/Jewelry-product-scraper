@@ -578,7 +578,11 @@ def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, An
     if not DATABASE_PATH.exists():
         raise HTTPException(404, "No catalog database is available.")
 
-    with tempfile.TemporaryDirectory(prefix="catalog-delete-") as temp_dir:
+    # Render mounts /tmp separately from /app/runtime, so the candidate must be
+    # created beside the active database for the final atomic replace to work.
+    with tempfile.TemporaryDirectory(
+        prefix=".catalog-delete-", dir=DATABASE_PATH.parent
+    ) as temp_dir:
         candidate = Path(temp_dir) / "catalog.sqlite"
         copy_database(DATABASE_PATH, candidate)
         deleted_products = delete_products(candidate, requested_ids)

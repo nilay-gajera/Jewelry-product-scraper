@@ -397,6 +397,35 @@ def test_failed_checkpoint_upload_leaves_active_catalog_untouched(
     assert catalog_summary(database)["products"] == 1
 
 
+def test_delete_candidate_uses_database_filesystem(tmp_path, monkeypatch):
+    export = tmp_path / "render-runtime" / "export"
+    export.mkdir(parents=True)
+    database = export / "catalog.sqlite"
+    _catalog(database)
+    candidate_parents = []
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+    monkeypatch.setattr(service, "process", None)
+    monkeypatch.setattr(
+        service,
+        "upload_database_checkpoint",
+        lambda path: candidate_parents.append(path.parent) or True,
+    )
+    monkeypatch.setattr(service, "upload_latest_artifacts", lambda *args: True)
+    monkeypatch.setattr(
+        service,
+        "rebuild_catalog_artifacts",
+        lambda *args: {"database_counts": {"products": 0}},
+    )
+
+    result = service.remove_product("99", delete_media=False)
+
+    assert result["deleted"] is True
+    assert len(candidate_parents) == 1
+    assert candidate_parents[0].parent == database.parent
+    assert catalog_summary(database)["products"] == 0
+
+
 def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch):
     runtime = tmp_path / "runtime"
     export = runtime / "export"
