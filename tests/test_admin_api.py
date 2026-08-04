@@ -241,6 +241,32 @@ def test_admin_images_use_private_s3_signed_url_when_cdn_is_placeholder(
     assert settings["public_media_url_ignored"] is True
 
 
+def test_variation_gallery_counts_as_a_valid_variation_image():
+    quality = admin_data.quality_for(
+        {
+            "name": "Ring",
+            "description": "Description",
+            "type": "variable",
+            "media": [{"source_url": "https://example.test/ring.jpg"}],
+            "categories": [{"name": "Rings"}],
+            "attributes": [{"name": "Metal"}],
+            "variations": [
+                {
+                    "id": "501",
+                    "attributes": {"Metal": "White Gold"},
+                    "image_url": None,
+                    "gallery": [
+                        {"source_url": "https://example.test/white.jpg"}
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert quality["variation_issues"] == 0
+    assert quality["complete"] is True
+
+
 def test_service_restores_s3_checkpoint_on_startup(tmp_path, monkeypatch):
     export = tmp_path / "export"
     database = export / "catalog.sqlite"

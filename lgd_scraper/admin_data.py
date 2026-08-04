@@ -174,7 +174,9 @@ def quality_for(product: dict[str, Any]) -> dict[str, Any]:
         missing.append("variations")
     variation_issues = 0
     for variation in variations:
-        if not variation.get("attributes") or not variation.get("image_url"):
+        if not variation.get("attributes") or not (
+            variation.get("image_url") or variation.get("gallery")
+        ):
             variation_issues += 1
     score = max(0, round(100 - (len(missing) * 14) - (variation_issues * 2)))
     return {

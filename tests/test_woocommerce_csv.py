@@ -4,7 +4,11 @@ import csv
 import json
 import sqlite3
 
-from lgd_scraper.woocommerce_csv import _media_url, export_woocommerce_csvs
+from lgd_scraper.woocommerce_csv import (
+    _media_url,
+    _variation_sku,
+    export_woocommerce_csvs,
+)
 
 
 def test_placeholder_cdn_is_not_written_to_woocommerce_images():
@@ -16,6 +20,13 @@ def test_placeholder_cdn_is_not_written_to_woocommerce_images():
     assert _media_url(
         media, "https://your-cdn-domain/jewelry-product-scraper/media"
     ) == "https://source.test/ring.jpg"
+
+
+def test_variation_inheriting_parent_sku_gets_a_unique_import_sku():
+    product = {"id": "99", "sku": "LGD-99"}
+    variation = {"id": "501", "sku": "LGD-99"}
+
+    assert _variation_sku(product, variation) == "LGD-99-V-501"
 
 
 def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):

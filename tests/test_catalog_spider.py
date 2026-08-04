@@ -50,6 +50,16 @@ def test_store_api_product_normalization_converts_minor_units():
     assert product["media"][0]["source_url"].endswith("/ring.jpg")
 
 
+def test_store_api_product_name_decodes_html_entities():
+    spider = WooCommerceCatalogSpider(enrich_html=False)
+
+    product = spider._normalize_product(
+        {"id": 42, "name": "Ali&#8217;i Ring"}, "store"
+    )
+
+    assert product["name"] == "Ali’i Ring"
+
+
 def test_loose_diamond_name_specs_become_attributes_without_dead_html_request():
     spider = WooCommerceCatalogSpider(enrich_html=True)
 
@@ -422,6 +432,35 @@ def test_variation_gallery_reads_store_extensions_and_preserves_attachment_ids()
         "905",
         "906",
     ]
+
+
+def test_parent_store_record_restores_missing_variation_attributes():
+    product = {
+        "name": "Alexandra Ring",
+        "raw_api": {
+            "variations": [
+                {
+                    "id": 501,
+                    "attributes": [{"name": "Metal", "value": "14k-white-gold"}],
+                }
+            ]
+        },
+    }
+    variations = [
+        {
+            "id": 501,
+            "name": "Alexandra Ring",
+            "attributes": {},
+            "gallery": [{"source_url": "https://example.test/white.jpg"}],
+        }
+    ]
+
+    WooCommerceCatalogSpider._merge_parent_variation_attributes(
+        product, variations
+    )
+
+    assert variations[0]["attributes"] == {"Metal": "14k-white-gold"}
+    assert variations[0]["name"] == "Alexandra Ring — Metal: 14k-white-gold"
 
 
 def test_media_deduplication_prefers_semantic_roles_and_keeps_variation_links():

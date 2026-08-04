@@ -133,6 +133,20 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                         )
                     ):
                         refresh.add(normalized_id)
+                        continue
+                    variations = product.get("variations") or []
+                    if product.get("type") == "variable" and (
+                        not variations
+                        or any(
+                            not variation.get("attributes")
+                            or (
+                                variation.get("sku")
+                                and variation.get("sku") == product.get("sku")
+                            )
+                            for variation in variations
+                        )
+                    ):
+                        refresh.add(normalized_id)
                 return existing, refresh
             finally:
                 connection.close()
@@ -289,6 +303,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         if self._should_enrich_product(product):
             yield self._page_request(product["url"], product)
         else:
+            self._merge_parent_variation_attributes(product, accumulated)
             self._promote_structured_variations(product, accumulated)
             yield from self._finish_product(product)
 
@@ -316,6 +331,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             yield self._store_variation_request(product, page + 1, accumulated)
             return
 
+        self._merge_parent_variation_attributes(product, accumulated)
         self._promote_structured_variations(product, accumulated)
         yield from self._finish_product(product)
 
@@ -330,6 +346,48 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         product["variations"] = structured
         if structured:
             product["variation_source_fallback"] = "json_ld"
+
+    @staticmethod
+    def _merge_parent_variation_attributes(
+        product: dict[str, Any], variations: list[dict[str, Any]]
+    ) -> None:
+        """Merge Store API's parent-level variation attributes by variation ID."""
+
+        parent_variations = (product.get("raw_api") or {}).get("variations") or []
+        attributes_by_id: dict[str, dict[str, Any]] = {}
+        for raw_variation in parent_variations:
+            variation_id = str(raw_variation.get("id") or "")
+            raw_attributes = raw_variation.get("attributes") or []
+            if not variation_id or not isinstance(raw_attributes, list):
+                continue
+            attributes = {
+                str(
+                    item.get("name")
+                    or item.get("taxonomy")
+                    or item.get("id")
+                ): (
+                    item.get("option")
+                    or item.get("value")
+                    or item.get("term")
+                    or item.get("name")
+                )
+                for item in raw_attributes
+                if isinstance(item, dict)
+            }
+            if attributes:
+                attributes_by_id[variation_id] = attributes
+
+        product_name = str(product.get("name") or "")
+        for variation in variations:
+            if variation.get("attributes"):
+                continue
+            attributes = attributes_by_id.get(str(variation.get("id") or ""))
+            if not attributes:
+                continue
+            variation["attributes"] = attributes
+            parts = [f"{key}: {value}" for key, value in attributes.items() if value]
+            if parts:
+                variation["name"] = f"{product_name} — {' / '.join(parts)}"
 
     def parse_product_page(self, response: Response, api_product: dict[str, Any] | None = None):
         product = dict(api_product or self._product_shell(response))
@@ -658,7 +716,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "_record_type": "product",
             "source": f"woocommerce_{source}_api",
             "id": raw.get("id"),
-            "name": raw.get("name"),
+            "name": _clean_html(raw.get("name")),
             "slug": raw.get("slug"),
             "url": raw.get("permalink") or raw.get("url"),
             "sku": raw.get("sku"),

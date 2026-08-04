@@ -87,7 +87,11 @@ def _variation_sku(product: dict[str, Any], variation: dict[str, Any]) -> str:
     variation_id = variation.get("id") or _slug(
         json.dumps(variation.get("attributes", {}), sort_keys=True)
     )[:24]
-    return str(variation.get("sku") or f"{_product_sku(product)}-V-{variation_id}")
+    parent_sku = _product_sku(product)
+    source_sku = str(variation.get("sku") or "")
+    if source_sku and source_sku != parent_sku:
+        return source_sku
+    return f"{parent_sku}-V-{variation_id}"
 
 
 def _published(status: Any) -> int:
