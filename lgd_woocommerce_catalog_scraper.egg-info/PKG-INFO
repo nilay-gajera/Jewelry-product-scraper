@@ -10,4 +10,5 @@ Requires-Dist: scrapy-playwright<1,>=0.0.46
 Requires-Dist: Pillow<13,>=10
 Requires-Dist: uvicorn[standard]<1,>=0.34
 Provides-Extra: dev
+Requires-Dist: httpx<1,>=0.28; extra == "dev"
 Requires-Dist: pytest<10,>=8; extra == "dev"

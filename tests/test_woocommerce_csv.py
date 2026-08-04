@@ -71,6 +71,13 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
                 "source_url": "https://source.test/ring-white.jpg",
                 "local_path": "products/99/ring-white.jpg",
             },
+            {
+                "role": "variation_gallery",
+                "position": 0,
+                "variation_id": 501,
+                "source_url": "https://source.test/ring-white-side.jpg",
+                "local_path": "products/99/ring-white-side.jpg",
+            },
         ],
         "variations": [
             {
@@ -124,5 +131,6 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
     assert rows[1]["SKU"] == "LGD-P-99-V-501"
     assert rows[1]["Attribute 1 value(s)"] == "14K White Gold"
     assert rows[1]["Images"] == (
-        "https://cdn.example.test/catalog/media/products/99/ring-white.jpg"
+        "https://cdn.example.test/catalog/media/products/99/ring-white.jpg, "
+        "https://cdn.example.test/catalog/media/products/99/ring-white-side.jpg"
     )

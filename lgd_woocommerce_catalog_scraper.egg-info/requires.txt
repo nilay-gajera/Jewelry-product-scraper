@@ -6,4 +6,5 @@ Pillow<13,>=10
 uvicorn[standard]<1,>=0.34
 
 [dev]
+httpx<1,>=0.28
 pytest<10,>=8

@@ -13,7 +13,7 @@ const paths = {
   chevron: <path d="m9 6 6 6-6 6"/>,
   close: <path d="m6 6 12 12M18 6 6 18"/>,
   image: <><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 20"/></>,
-  tag: <path d="M20 13 13 20 4 11V4h7Z"/><circle cx="8.5" cy="8.5" r="1"/>,
+  tag: <><path d="M20 13 13 20 4 11V4h7Z"/><circle cx="8.5" cy="8.5" r="1"/></>,
   alert: <><path d="M12 3 2.8 20h18.4Z"/><path d="M12 9v5M12 17.2v.1"/></>,
   check: <path d="m5 12 4 4L19 6"/>,
   refresh: <><path d="M20 6v5h-5"/><path d="M18.5 15.5A8 8 0 1 1 19.8 9"/></>,

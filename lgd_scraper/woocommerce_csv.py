@@ -127,7 +127,7 @@ def _product_image_urls(
     seen: set[str] = set()
     result: list[str] = []
     for item in media:
-        if item.get("role") == "variation":
+        if item.get("role") in {"variation", "variation_gallery"}:
             continue
         url = _media_url(item, public_base_url)
         if url and url not in seen:
@@ -152,8 +152,8 @@ def _variation_image_urls(
         if url and url not in result:
             result.append(url)
     fallback = str(variation.get("image_url") or "")
-    if fallback and fallback not in result:
-        result.insert(0, fallback)
+    if not result and fallback:
+        result.append(fallback)
     for image in variation.get("gallery") or []:
         url = _media_url(image, public_base_url)
         if url and url not in result:
