@@ -4,10 +4,10 @@ This project exports the public or authorized WooCommerce catalog at
 `loosegrowndiamond.com`, including:
 
 - Parent products and product metadata
-- Product and variation images
+- Product images plus resolved variation gallery URLs and unresolved attachment IDs
 - Variation names, IDs, SKUs, prices, stock, and attribute combinations
-- Product attributes and global attribute terms
-- Product categories and category hierarchy
+- Descriptions, short descriptions, SEO metadata, tags, brands, dimensions, and stock fields
+- Product attributes, global attribute terms, categories, and category hierarchy
 - Normalized SQLite, JSONL, CSV, S3 media, and WooCommerce import sheets
 
 The crawler uses [Scrapy](https://docs.scrapy.org/en/latest/) for scheduling,
@@ -45,6 +45,12 @@ site's product sitemap.
 
 Public mode can retrieve only published storefront data. It cannot guarantee
 draft/private products or admin-only plugin metadata.
+
+For custom themes and gallery plugins, the parser also reads Store API
+`extensions`, common gallery metadata keys, embedded `data-product_variations`
+JSON, JSON-LD `ProductGroup` variants, structured prices/availability, and
+custom-theme product description/SKU selectors. WooCommerce API variations stay
+authoritative; structured variants are used only when that lookup fails.
 
 ## Installation
 

@@ -168,6 +168,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             if self.enrich_html and product.get("url"):
                 yield self._page_request(product["url"], product)
             else:
+                self._promote_structured_variations(product, accumulated)
+                self._add_variation_media(product)
                 yield product
             return
 
@@ -199,6 +201,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         if self.enrich_html and product.get("url"):
             yield self._page_request(product["url"], product)
         else:
+            self._promote_structured_variations(product, accumulated)
             yield product
 
     def parse_store_variations(self, response: Response):
@@ -211,6 +214,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 "store_variations_unavailable",
                 f"Public variation lookup failed for product {product.get('id')}.",
             )
+            self._promote_structured_variations(product, accumulated)
+            self._add_variation_media(product)
             yield product
             return
 
@@ -224,9 +229,21 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             yield self._store_variation_request(product, page + 1, accumulated)
             return
 
-        product["variations"] = accumulated
+        self._promote_structured_variations(product, accumulated)
         self._add_variation_media(product)
         yield product
+
+    @staticmethod
+    def _promote_structured_variations(
+        product: dict[str, Any], accumulated: list[dict[str, Any]]
+    ) -> None:
+        if accumulated:
+            product["variations"] = accumulated
+            return
+        structured = product.get("structured_variations") or []
+        product["variations"] = structured
+        if structured:
+            product["variation_source_fallback"] = "json_ld"
 
     def parse_product_page(self, response: Response, api_product: dict[str, Any] | None = None):
         product = dict(api_product or self._product_shell(response))
@@ -252,21 +269,34 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         )
         product["url"] = response.url
         product["name"] = product.get("name") or _text(
-            response.css("h1.product_title *::text, h1.product_title::text").getall()
+            response.css(
+                "h1.product_title *::text, h1.product_title::text, "
+                "h1[itemprop='name'] *::text, h1[itemprop='name']::text, "
+                "main h1 *::text, main h1::text"
+            ).getall()
+        ) or response.css('meta[property="og:title"]::attr(content)').get()
+        product["sku"] = product.get("sku") or _text(
+            response.css(
+                ".sku::text, [itemprop='sku']::attr(content), "
+                "[itemprop='sku']::text, [data-product-sku]::attr(data-product-sku)"
+            ).getall()
         )
-        product["sku"] = product.get("sku") or _text(response.css(".sku::text").getall())
         product["id"] = product.get("id") or self._html_product_id(response)
         product["slug"] = product.get("slug") or self._slug(response.url)
         product["description"] = product.get("description") or _text(
             response.css(
-                "#tab-description *::text, .woocommerce-product-details__short-description *::text"
+                "#tab-description *::text, .woocommerce-Tabs-panel--description *::text, "
+                "#product-description *::text, .product-description *::text, "
+                "[itemprop='description'] *::text, "
+                ".woocommerce-product-details__short-description *::text"
             ).getall()
         )
         description_node = response.css(
-            "#tab-description, .woocommerce-Tabs-panel--description"
+            "#tab-description, .woocommerce-Tabs-panel--description, "
+            "#product-description, .product-description, [itemprop='description']"
         )
         short_node = response.css(
-            ".woocommerce-product-details__short-description"
+            ".woocommerce-product-details__short-description, .product-short-description"
         )
         product["description_html"] = product.get("description_html") or (
             description_node.get() or ""
@@ -289,12 +319,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
 
         self._merge_json_ld(product, response)
         self._merge_html_categories(product, response)
+        self._merge_html_tags_and_brands(product, response)
         self._merge_html_attributes(product, response)
         self._merge_html_media(product, response)
 
-        embedded = response.css(
-            "form.variations_form::attr(data-product_variations)"
-        ).get()
+        embedded = response.css("[data-product_variations]::attr(data-product_variations)").get()
         if embedded and embedded.strip() not in {"", "false"}:
             try:
                 variations = json.loads(html.unescape(embedded))
@@ -314,6 +343,16 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                     for item in variations
                 ]
                 self._add_variation_media(product)
+
+        if (
+            self.authenticated
+            and product.get("type") == "variable"
+            and not product.get("variations")
+            and product.get("structured_variations")
+        ):
+            product["variations"] = product["structured_variations"]
+            product["variation_source_fallback"] = "json_ld"
+            self._add_variation_media(product)
 
         product["media"] = self._dedupe_media(product.get("media", []))
 
@@ -504,6 +543,10 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             text = str(add_to_cart.get("text") or "").lower()
             product_type = "variable" if "select" in text or "option" in text else "simple"
 
+        stock_status = raw.get("stock_status")
+        if stock_status is None and raw.get("is_in_stock") is not None:
+            stock_status = "instock" if raw.get("is_in_stock") else "outofstock"
+
         product = {
             "_record_type": "product",
             "source": f"woocommerce_{source}_api",
@@ -524,8 +567,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "regular_price": regular_price,
             "sale_price": sale_price,
             "price_html": raw.get("price_html"),
-            "stock_status": raw.get("stock_status")
-            or ("instock" if raw.get("is_in_stock") else "outofstock"),
+            "stock_status": stock_status,
             "stock_quantity": raw.get("stock_quantity"),
             "manage_stock": raw.get("manage_stock"),
             "backorders": raw.get("backorders"),
@@ -629,6 +671,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             sale_price = raw.get("sale_price")
 
         image = raw.get("image") or {}
+        if isinstance(image, str):
+            image = {"src": image}
         image_url = (
             image.get("full_src")
             or image.get("src")
@@ -656,8 +700,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "regular_price": str(regular_price) if regular_price is not None else None,
             "sale_price": str(sale_price) if sale_price is not None else None,
             "stock_status": stock_status,
-            "stock_quantity": raw.get("stock_quantity")
-            or raw.get("max_qty"),
+            "stock_quantity": (
+                raw.get("stock_quantity")
+                if raw.get("stock_quantity") is not None
+                else raw.get("max_qty")
+            ),
             "purchasable": raw.get("purchasable", raw.get("is_purchasable")),
             "visible": raw.get("visible", raw.get("variation_is_visible")),
             "image_url": image_url,
@@ -665,6 +712,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "image_width": image.get("width"),
             "image_height": image.get("height"),
             "gallery": gallery,
+            "gallery_image_ids": self._variation_gallery_ids(raw),
             "description": _clean_html(
                 raw.get("description") or raw.get("variation_description")
             ),
@@ -678,21 +726,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
     ) -> list[dict[str, Any]]:
         """Collect common variation-gallery plugin fields without executing code."""
 
-        values: list[Any] = []
-        for key in (
-            "images",
-            "gallery",
-            "gallery_images",
-            "variation_gallery_images",
-            "woo_variation_gallery_images",
-            "additional_images",
-        ):
-            if raw.get(key):
-                values.append(raw[key])
-        for entry in raw.get("meta_data") or []:
-            key = str(entry.get("key") or "").lower()
-            if "gallery" in key and "image" in key:
-                values.append(entry.get("value"))
+        values = self._variation_gallery_values(raw)
 
         images: list[dict[str, Any]] = []
 
@@ -705,8 +739,16 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                     or value.get("src")
                     or value.get("url")
                     or value.get("thumbnail")
+                    or value.get("gallery_image_src")
+                    or value.get("archive_src")
+                    or value.get("thumb_src")
+                    or value.get("large")
+                    or value.get("full")
                 )
-                if url:
+                if isinstance(url, (dict, list, tuple)):
+                    collect(url)
+                    url = None
+                if isinstance(url, str) and url:
                     images.append(
                         {
                             "source_url": url,
@@ -724,7 +766,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                     collect(nested)
                 return
             if isinstance(value, str):
-                stripped = value.strip()
+                stripped = html.unescape(value).strip()
                 if stripped.startswith(("[", "{")):
                     try:
                         collect(json.loads(stripped))
@@ -748,6 +790,76 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             image_item["position"] = position
         return gallery
 
+    def _variation_gallery_values(self, raw: dict[str, Any]) -> list[Any]:
+        values: list[Any] = []
+        for key in (
+            "images",
+            "gallery",
+            "gallery_images",
+            "variation_images",
+            "variation_gallery_images",
+            "woo_variation_gallery_images",
+            "additional_images",
+        ):
+            if raw.get(key):
+                values.append(raw[key])
+        for entry in raw.get("meta_data") or []:
+            key = str(entry.get("key") or "").lower()
+            if "gallery" in key and ("image" in key or "variation" in key):
+                values.append(entry.get("value"))
+
+        def scan_extension(value: Any) -> None:
+            if not isinstance(value, dict):
+                return
+            for key, nested in value.items():
+                normalized = str(key).lower()
+                if any(token in normalized for token in ("gallery", "images", "media")):
+                    values.append(nested)
+                elif isinstance(nested, dict):
+                    scan_extension(nested)
+
+        scan_extension(raw.get("extensions") or {})
+        return values
+
+    def _variation_gallery_ids(self, raw: dict[str, Any]) -> list[str]:
+        references: list[str] = []
+
+        def collect(value: Any) -> None:
+            if value in (None, "", False):
+                return
+            if isinstance(value, dict):
+                for key in ("id", "image_id", "attachment_id"):
+                    candidate = value.get(key)
+                    if str(candidate or "").isdigit():
+                        references.append(str(candidate))
+                for key, nested in value.items():
+                    if isinstance(nested, (dict, list, tuple)) or (
+                        "id" in str(key).lower() and isinstance(nested, (str, int))
+                    ):
+                        collect(nested)
+                return
+            if isinstance(value, (list, tuple)):
+                for nested in value:
+                    collect(nested)
+                return
+            if isinstance(value, int):
+                references.append(str(value))
+                return
+            if isinstance(value, str):
+                stripped = html.unescape(value).strip()
+                if stripped.startswith(("[", "{")):
+                    try:
+                        collect(json.loads(stripped))
+                        return
+                    except json.JSONDecodeError:
+                        pass
+                if re.fullmatch(r"\d+(?:[\s,|]+\d+)*", stripped):
+                    references.extend(re.findall(r"\d+", stripped))
+
+        for value in self._variation_gallery_values(raw):
+            collect(value)
+        return list(dict.fromkeys(references))
+
     def _merge_json_ld(self, product: dict[str, Any], response: Response) -> None:
         for value in response.css(
             'script[type="application/ld+json"]::text'
@@ -759,16 +871,22 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             candidates = payload.get("@graph", []) if isinstance(payload, dict) else payload
             if isinstance(candidates, dict):
                 candidates = [candidates]
-            if isinstance(payload, dict) and payload.get("@type") == "Product":
+            if isinstance(payload, dict) and payload.get("@type") in {
+                "Product",
+                "ProductGroup",
+            }:
                 candidates = [payload]
             for candidate in candidates or []:
                 if not isinstance(candidate, dict):
                     continue
                 candidate_type = candidate.get("@type")
-                if candidate_type != "Product" and not (
-                    isinstance(candidate_type, list) and "Product" in candidate_type
+                accepted_types = {"Product", "ProductGroup"}
+                if candidate_type not in accepted_types and not (
+                    isinstance(candidate_type, list)
+                    and accepted_types.intersection(candidate_type)
                 ):
                     continue
+                product.setdefault("structured_data", []).append(candidate)
                 product["name"] = product.get("name") or candidate.get("name")
                 product["sku"] = product.get("sku") or candidate.get("sku")
                 product["description"] = (
@@ -784,8 +902,34 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                             "assignment_source": "json_ld",
                         }
                     ]
+                offers = candidate.get("offers") or {}
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                if isinstance(offers, dict):
+                    product["price"] = (
+                        product.get("price")
+                        or offers.get("price")
+                        or offers.get("lowPrice")
+                        or offers.get("highPrice")
+                    )
+                    product["currency"] = product.get("currency") or offers.get(
+                        "priceCurrency"
+                    )
+                    availability = str(offers.get("availability") or "").lower()
+                    if not product.get("stock_status") and availability:
+                        product["stock_status"] = (
+                            "outofstock" if "outofstock" in availability else "instock"
+                        )
+                rating = candidate.get("aggregateRating") or {}
+                if isinstance(rating, dict):
+                    product["average_rating"] = product.get(
+                        "average_rating"
+                    ) or rating.get("ratingValue")
+                    product["rating_count"] = product.get("rating_count") or rating.get(
+                        "ratingCount"
+                    )
                 images = candidate.get("image") or []
-                if isinstance(images, str):
+                if isinstance(images, (str, dict)):
                     images = [images]
                 for position, image_url in enumerate(images):
                     if isinstance(image_url, dict):
@@ -798,6 +942,85 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                                 "source_url": image_url,
                             }
                         )
+                structured_variations = [
+                    self._normalize_json_ld_variation(item, product.get("name") or "")
+                    for item in candidate.get("hasVariant") or []
+                    if isinstance(item, dict)
+                ]
+                structured_variations = [
+                    item for item in structured_variations if item.get("id")
+                ]
+                if structured_variations:
+                    product["type"] = "variable"
+                    product["structured_variations"] = structured_variations
+
+    def _normalize_json_ld_variation(
+        self, raw: dict[str, Any], product_name: str
+    ) -> dict[str, Any]:
+        attributes: dict[str, Any] = {}
+        for key in ("color", "size", "material", "pattern"):
+            if raw.get(key):
+                attributes[key] = raw[key]
+        for property_item in raw.get("additionalProperty") or []:
+            if not isinstance(property_item, dict):
+                continue
+            name = property_item.get("name") or property_item.get("propertyID")
+            value = property_item.get("value") or property_item.get("valueReference")
+            if name and value not in (None, ""):
+                attributes[str(name)] = value
+
+        offers = raw.get("offers") or {}
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        offers = offers if isinstance(offers, dict) else {}
+        images = raw.get("image") or []
+        if isinstance(images, (str, dict)):
+            images = [images]
+        normalized_images: list[dict[str, Any]] = []
+        for image_item in images:
+            if isinstance(image_item, str):
+                normalized_images.append({"source_url": image_item})
+            elif isinstance(image_item, dict):
+                url = image_item.get("url") or image_item.get("contentUrl")
+                if url:
+                    normalized_images.append(
+                        {"source_url": url, "alt": image_item.get("caption")}
+                    )
+        availability = str(offers.get("availability") or "").lower()
+        variation_id = raw.get("productID") or raw.get("sku") or raw.get("@id")
+        parts = [f"{key}: {value}" for key, value in attributes.items()]
+        return {
+            "source": "json_ld",
+            "id": variation_id,
+            "name": raw.get("name")
+            or (f"{product_name} — {' / '.join(parts)}" if parts else product_name),
+            "sku": raw.get("sku"),
+            "attributes": attributes,
+            "price": str(offers.get("price"))
+            if offers.get("price") is not None
+            else None,
+            "regular_price": None,
+            "sale_price": None,
+            "currency": offers.get("priceCurrency"),
+            "stock_status": (
+                "outofstock" if "outofstock" in availability else "instock"
+            )
+            if availability
+            else None,
+            "image_url": normalized_images[0]["source_url"]
+            if normalized_images
+            else None,
+            "image_alt": normalized_images[0].get("alt")
+            if normalized_images
+            else None,
+            "gallery": [
+                {**image_item, "position": position}
+                for position, image_item in enumerate(normalized_images[1:])
+            ],
+            "gallery_image_ids": [],
+            "description": _clean_html(raw.get("description")),
+            "raw": raw,
+        }
 
     def _merge_html_categories(self, product: dict[str, Any], response: Response) -> None:
         categories = list(product.get("categories") or [])
@@ -834,6 +1057,68 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             key = str(category.get("id") or category.get("slug") or category.get("name"))
             unique[key] = category
         product["categories"] = list(unique.values())
+
+    def _merge_html_tags_and_brands(
+        self, product: dict[str, Any], response: Response
+    ) -> None:
+        tags = list(product.get("tags") or [])
+        for link in response.css(".tagged_as a, .product_meta a[rel='tag']"):
+            name = _text(link.css("*::text, ::text").getall())
+            url = link.attrib.get("href")
+            if name:
+                tags.append(
+                    {
+                        "id": self._slug(url or name),
+                        "name": name,
+                        "slug": self._slug(url or name),
+                        "url": url,
+                        "assignment_source": "product_page_assigned",
+                    }
+                )
+        product["tags"] = list(
+            {
+                str(item.get("id") or item.get("slug") or item.get("name")): item
+                for item in tags
+                if isinstance(item, dict)
+            }.values()
+        )
+
+        brands = list(product.get("brands") or [])
+        for link in response.css(
+            ".pwb-single-product-brands a, .woocommerce-product-brand a, "
+            ".product-brands a"
+        ):
+            name = _text(link.css("*::text, ::text").getall())
+            url = link.attrib.get("href")
+            if name:
+                brands.append(
+                    {
+                        "id": self._slug(url or name),
+                        "name": name,
+                        "slug": self._slug(url or name),
+                        "url": url,
+                        "assignment_source": "product_page_assigned",
+                    }
+                )
+        brand_meta = response.css(
+            '[itemprop="brand"]::attr(content), meta[property="product:brand"]::attr(content)'
+        ).get()
+        if brand_meta and not brands:
+            brands.append(
+                {
+                    "id": self._slug(brand_meta),
+                    "name": brand_meta,
+                    "slug": self._slug(brand_meta),
+                    "assignment_source": "structured_meta",
+                }
+            )
+        product["brands"] = list(
+            {
+                str(item.get("id") or item.get("slug") or item.get("name")): item
+                for item in brands
+                if isinstance(item, dict)
+            }.values()
+        )
 
     def _merge_html_attributes(self, product: dict[str, Any], response: Response) -> None:
         attributes = list(product.get("attributes") or [])
@@ -1131,7 +1416,10 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "url": response.url,
             "sku": None,
             "type": "simple",
+            "status": "publish",
             "categories": [],
+            "tags": [],
+            "brands": [],
             "attributes": [],
             "variations": [],
             "media": [],
