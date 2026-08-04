@@ -62,3 +62,40 @@ def test_private_media_presigned_url_uses_media_prefix(monkeypatch):
         "https://signed.test/catalog-bucket/exports/jewelry/latest/"
         "catalog-export.zip?ttl=600"
     )
+
+
+def test_delete_media_objects_uses_scoped_s3_keys(monkeypatch):
+    requests = []
+
+    class FakeS3:
+        def delete_objects(self, **kwargs):
+            requests.append(kwargs)
+            return {}
+
+    monkeypatch.setenv("S3_BUCKET", "catalog-bucket")
+    monkeypatch.setenv("S3_PREFIX", "jewelry-product-scraper")
+    monkeypatch.setattr(s3sync, "s3_client", lambda: FakeS3())
+
+    deleted = s3sync.delete_media_objects(
+        [
+            "products/99/ring.jpg",
+            "products/99/ring.jpg",
+            "../outside.jpg",
+            "https://source.test/original.jpg",
+        ]
+    )
+
+    assert deleted == 1
+    assert requests == [
+        {
+            "Bucket": "catalog-bucket",
+            "Delete": {
+                "Objects": [
+                    {
+                        "Key": "jewelry-product-scraper/media/products/99/ring.jpg"
+                    }
+                ],
+                "Quiet": True,
+            },
+        }
+    ]

@@ -197,6 +197,68 @@ def upload_final_artifacts(output_dir: Path) -> None:
         raise
 
 
+def upload_database_checkpoint(database_path: Path) -> bool:
+    """Replace the active S3 checkpoint with a snapshot of one database."""
+
+    if not s3_enabled():
+        return False
+    database_path = Path(database_path).resolve()
+    pipeline = S3ArtifactPipeline()
+    pipeline.output_dir = database_path.parent
+    pipeline.bucket = os.environ["S3_BUCKET"]
+    pipeline._upload_checkpoint()
+    return True
+
+
+def upload_latest_artifacts(output_dir: Path) -> bool:
+    """Refresh mutable latest artifacts without rewriting historical runs."""
+
+    if not s3_enabled():
+        return False
+    pipeline = S3ArtifactPipeline()
+    pipeline.output_dir = Path(output_dir).resolve()
+    pipeline.bucket = os.environ["S3_BUCKET"]
+    pipeline._upload_checkpoint()
+    pipeline._upload_final_artifacts(include_run_archive=False)
+    return True
+
+
+def delete_media_objects(local_paths: list[str]) -> int:
+    """Delete selected downloaded media keys while preserving run archives."""
+
+    if not s3_enabled():
+        return 0
+    normalized_paths = list(
+        dict.fromkeys(
+            str(path).replace("\\", "/").lstrip("/")
+            for path in local_paths
+            if path
+            and not str(path).startswith(("http://", "https://"))
+            and ".." not in str(path).replace("\\", "/").split("/")
+        )
+    )
+    if not normalized_paths:
+        return 0
+
+    client = s3_client()
+    deleted = 0
+    for index in range(0, len(normalized_paths), 1000):
+        batch = normalized_paths[index : index + 1000]
+        response = client.delete_objects(
+            Bucket=os.environ["S3_BUCKET"],
+            Delete={
+                "Objects": [{"Key": _key("media", path)} for path in batch],
+                "Quiet": True,
+            },
+        )
+        errors = response.get("Errors") or []
+        if errors:
+            failed_keys = ", ".join(str(item.get("Key")) for item in errors[:5])
+            raise RuntimeError(f"S3 could not delete media objects: {failed_keys}")
+        deleted += len(batch)
+    return deleted
+
+
 def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -277,7 +339,7 @@ class S3ArtifactPipeline:
             files.append(path)
         return files
 
-    def _upload_final_artifacts(self) -> None:
+    def _upload_final_artifacts(self, include_run_archive: bool = True) -> None:
         client = s3_client()
         run_id = os.getenv("SCRAPER_RUN_ID") or datetime.now(UTC).strftime(
             "%Y%m%dT%H%M%SZ"
@@ -302,8 +364,13 @@ class S3ArtifactPipeline:
                 for path in upload_files:
                     archive.write(path, arcname=path.name)
 
+            branches = (
+                ("latest", f"runs/{run_id}")
+                if include_run_archive
+                else ("latest",)
+            )
             for path in upload_files:
-                for branch in ("latest", f"runs/{run_id}"):
+                for branch in branches:
                     client.upload_file(
                         str(path),
                         self.bucket,
@@ -311,7 +378,7 @@ class S3ArtifactPipeline:
                         ExtraArgs=_extra_args(),
                     )
 
-            for branch in ("latest", f"runs/{run_id}"):
+            for branch in branches:
                 client.upload_file(
                     str(archive_path),
                     self.bucket,
@@ -339,9 +406,10 @@ class S3ArtifactPipeline:
                 _key("latest", manifest_path.name),
                 ExtraArgs=_extra_args(),
             )
-            client.upload_file(
-                str(manifest_path),
-                self.bucket,
-                _key("runs", run_id, manifest_path.name),
-                ExtraArgs=_extra_args(),
-            )
+            if include_run_archive:
+                client.upload_file(
+                    str(manifest_path),
+                    self.bucket,
+                    _key("runs", run_id, manifest_path.name),
+                    ExtraArgs=_extra_args(),
+                )

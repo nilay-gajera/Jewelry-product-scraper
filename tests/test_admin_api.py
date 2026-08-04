@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import service
 from lgd_scraper import admin_data
 from lgd_scraper.admin_data import catalog_summary, list_products, product_detail
+from lgd_scraper.catalog_mutations import copy_database, delete_product
 
 
 def _catalog(path):
@@ -181,6 +184,50 @@ def test_service_gracefully_stops_active_crawl(monkeypatch):
     assert current.wait_timeouts == [240]
 
 
+def test_product_deletion_uses_a_copy_and_removes_related_records(tmp_path):
+    source = tmp_path / "source.sqlite"
+    candidate = tmp_path / "candidate.sqlite"
+    _catalog(source)
+    copy_database(source, candidate)
+
+    deleted = delete_product(candidate, "99")
+
+    assert deleted == {
+        "id": "99",
+        "name": "Adriana Ring",
+        "media_paths": ["products/99/ring.jpg"],
+    }
+    assert catalog_summary(source)["products"] == 1
+    assert catalog_summary(candidate)["products"] == 0
+    connection = sqlite3.connect(candidate)
+    assert connection.execute("SELECT COUNT(*) FROM variations").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM images").fetchone()[0] == 0
+    connection.close()
+
+
+def test_failed_checkpoint_upload_leaves_active_catalog_untouched(
+    tmp_path, monkeypatch
+):
+    export = tmp_path / "export"
+    export.mkdir()
+    database = export / "catalog.sqlite"
+    _catalog(database)
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+    monkeypatch.setattr(service, "process", None)
+    monkeypatch.setattr(
+        service,
+        "upload_database_checkpoint",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("S3 unavailable")),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        service.remove_product("99", delete_media=False)
+
+    assert error.value.status_code == 502
+    assert catalog_summary(database)["products"] == 1
+
+
 def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch):
     runtime = tmp_path / "runtime"
     export = runtime / "export"
@@ -206,6 +253,24 @@ def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch
     }
     monkeypatch.setattr(service, "discover_catalog", lambda *args, **kwargs: discovered)
     monkeypatch.setattr(service, "save_json_object", lambda *args, **kwargs: True)
+    checkpoint_uploads = []
+    media_deletions = []
+    monkeypatch.setattr(
+        service,
+        "upload_database_checkpoint",
+        lambda path: checkpoint_uploads.append(path.read_bytes()) or True,
+    )
+    monkeypatch.setattr(service, "upload_latest_artifacts", lambda *args: True)
+    monkeypatch.setattr(
+        service,
+        "delete_media_objects",
+        lambda paths: media_deletions.extend(paths) or len(paths),
+    )
+    monkeypatch.setattr(
+        service,
+        "rebuild_catalog_artifacts",
+        lambda *args: {"database_counts": {"products": 0}},
+    )
 
     with TestClient(service.app) as client:
         assert client.get("/api/status").status_code == 401
@@ -220,6 +285,11 @@ def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch
             headers=headers,
             json={"base_url": "https://example.test/"},
         )
+        deleted = client.delete(
+            "/api/products/99?delete_media=true", headers=headers
+        )
+        missing_product = client.get("/api/products/99", headers=headers)
+        remaining_products = client.get("/api/products", headers=headers)
 
     assert session.status_code == 200
     assert status.json()["catalog"]["products"] == 1
@@ -228,3 +298,10 @@ def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch
     assert empty_discovery.json()["total_products"] == 0
     assert refreshed_discovery.json()["total_products"] == 88
     assert (runtime / "catalog-discovery.json").exists()
+    assert deleted.status_code == 200
+    assert deleted.json()["checkpoint_updated"] is True
+    assert deleted.json()["media_deleted"] == 1
+    assert missing_product.status_code == 404
+    assert remaining_products.json()["total"] == 0
+    assert len(checkpoint_uploads) == 1
+    assert media_deletions == ["products/99/ring.jpg"]

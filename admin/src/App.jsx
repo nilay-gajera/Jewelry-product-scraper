@@ -120,7 +120,7 @@ export function App() {
   return <AppShell page={page} onNavigate={navigate} onLogout={logout}>
     {notice ? <div className={`toast toast--${notice.tone}`} role="status"><span>{notice.message}</span><button onClick={() => setNotice(null)}>Dismiss</button></div> : null}
     {page === "overview" ? <OverviewPage status={status} settings={settings} products={products} logs={logs} busy={busy} onStart={start} onStop={stop} onDownload={download} onNavigate={navigate} /> : null}
-    {page === "products" ? <ProductsPage initialProductId={initialProductId} onError={showError} /> : null}
+    {page === "products" ? <ProductsPage initialProductId={initialProductId} onError={showError} onDeleted={(result) => { const warning = result.media_error || result.artifact_error; setNotice({ tone: warning ? "error" : "success", message: warning ? `Product deleted, but cleanup needs attention: ${warning}` : `${result.product_name} was deleted${result.media_requested ? ` with ${result.media_deleted} S3 media file${result.media_deleted === 1 ? "" : "s"}` : ""}.` }); refreshStatus().catch(showError); }} /> : null}
     {page === "runs" ? <RunsPage status={status} settings={settings} logs={logs} onStart={start} onStop={stop} onError={showError} /> : null}
     {page === "settings" ? <SettingsPage settings={settings} onSaved={(value) => { setSettings(value); setNotice({ tone: "success", message: "Settings saved to local runtime and S3." }); }} onError={showError} /> : null}
     {page === "exports" ? <ExportsPage status={status} onError={showError} /> : null}

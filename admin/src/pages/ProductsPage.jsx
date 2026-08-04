@@ -5,7 +5,7 @@ import { Icon } from "../icons.jsx";
 import { Button, EmptyState, LoadingLine, formatDate } from "../components/Ui.jsx";
 import { ProductThumb } from "./OverviewPage.jsx";
 
-export function ProductsPage({ initialProductId = "", onError }) {
+export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [type, setType] = useState("");
@@ -14,6 +14,7 @@ export function ProductsPage({ initialProductId = "", onError }) {
   const [selectedId, setSelectedId] = useState(initialProductId);
   const [detail, setDetail] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     let active = true;
@@ -24,7 +25,7 @@ export function ProductsPage({ initialProductId = "", onError }) {
       .catch(onError)
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [deferredQuery, type, page, onError]);
+  }, [deferredQuery, type, page, onError, refreshKey]);
 
   useEffect(() => {
     if (!selectedId) { setDetail(null); return; }
@@ -36,6 +37,15 @@ export function ProductsPage({ initialProductId = "", onError }) {
   }, [selectedId, onError]);
 
   const pages = Math.max(1, Math.ceil(data.total / data.page_size));
+
+  async function deleteSelectedProduct(deleteMedia) {
+    if (!detail?.id) return;
+    const result = await api(`/api/products/${encodeURIComponent(detail.id)}?delete_media=${deleteMedia ? "true" : "false"}`, { method: "DELETE" });
+    setSelectedId("");
+    setDetail(null);
+    setRefreshKey((value) => value + 1);
+    onDeleted?.(result);
+  }
 
   return (
     <main className="page page--products">
@@ -52,16 +62,19 @@ export function ProductsPage({ initialProductId = "", onError }) {
           </tbody></table></div> : <EmptyState title="No matching products" body="Change the filter or run the scraper to populate products." />}
           <footer className="pagination"><span>{data.total ? `${(page - 1) * data.page_size + 1}–${Math.min(page * data.page_size, data.total)} of ${data.total}` : "0 products"}</span><div><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)} aria-label="Previous page"><Icon name="chevron" className="icon-reverse" /></button><strong>{page}</strong><button disabled={page >= pages} onClick={() => setPage((value) => value + 1)} aria-label="Next page"><Icon name="chevron" /></button></div></footer>
         </section>
-        {selectedId ? <ProductInspector product={detail} onClose={() => setSelectedId("")} /> : null}
+        {selectedId ? <ProductInspector product={detail} onClose={() => setSelectedId("")} onDelete={deleteSelectedProduct} onError={onError} /> : null}
       </div>
     </main>
   );
 }
 
-function ProductInspector({ product, onClose }) {
+function ProductInspector({ product, onClose, onDelete, onError }) {
   const [tab, setTab] = useState("overview");
   const [selectedVariation, setSelectedVariation] = useState("");
-  useEffect(() => { setTab("overview"); setSelectedVariation(product?.variations?.[0]?.id || ""); }, [product?.id]);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleteMedia, setDeleteMedia] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  useEffect(() => { setTab("overview"); setSelectedVariation(product?.variations?.[0]?.id || ""); setConfirmingDelete(false); setDeleteMedia(false); }, [product?.id]);
   const media = product?.media || [];
   const productMedia = useMemo(() => uniqueMediaByUrl(media), [media]);
   const variations = product?.variations || [];
@@ -73,9 +86,19 @@ function ProductInspector({ product, onClose }) {
   const activeMedia = tab === "variations" && variationMedia.length ? variationMedia : productMedia;
   const featured = activeMedia.find((item) => item.role === "variation") || activeMedia.find((item) => item.role === "featured") || activeMedia[0];
 
+  async function confirmDelete() {
+    setDeleting(true);
+    try {
+      await onDelete(deleteMedia);
+    } catch (error) {
+      onError(error);
+      setDeleting(false);
+    }
+  }
+
   return (
     <aside className="product-inspector">
-      <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></header>
+      <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><div className="inspector-actions">{product ? <button className="icon-button icon-button--danger" onClick={() => setConfirmingDelete(true)} aria-label="Delete product"><Icon name="trash" /></button> : null}<button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></div></header>
       {!product ? <LoadingLine /> : <>
         <div className="inspector-hero">{featured ? <img src={featured.display_url || featured.source_url} alt={featured.alt || product.name || "Product"} /> : <span><Icon name="image" size={38} /></span>}</div>
         <div className="media-rail">{activeMedia.slice(0, 8).map((item) => <img key={item.source_url} src={item.display_url || item.source_url} alt={item.alt || ""} loading="lazy" />)}{activeMedia.length > 8 ? <span>+{activeMedia.length - 8}</span> : null}</div>
@@ -85,6 +108,7 @@ function ProductInspector({ product, onClose }) {
         {tab === "media" ? <MediaGrid media={productMedia} /> : null}
         {tab === "raw" ? <pre className="raw-data">{JSON.stringify(product, null, 2)}</pre> : null}
       </>}
+      {confirmingDelete ? <div className="dialog-backdrop"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-product-title"><div className="confirm-dialog__icon"><Icon name="trash" size={22} /></div><h2 id="delete-product-title">Delete this product?</h2><p><strong>{product?.name || product?.id}</strong> and all of its variations and assignments will be removed from the active catalog and S3 checkpoint.</p><label className="delete-media-option"><input type="checkbox" checked={deleteMedia} onChange={(event) => setDeleteMedia(event.target.checked)} /><span><strong>Also delete downloaded media from S3</strong><small>Historical run archives are kept for recovery.</small></span></label><footer><Button disabled={deleting} onClick={() => setConfirmingDelete(false)}>Cancel</Button><Button icon="trash" tone="danger" disabled={deleting} onClick={confirmDelete}>{deleting ? "Deleting…" : "Delete product"}</Button></footer></section></div> : null}
     </aside>
   );
 }

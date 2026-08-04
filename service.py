@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -30,13 +31,21 @@ from lgd_scraper.admin_data import (
     secret_presence,
     storage_settings,
 )
+from lgd_scraper.catalog_mutations import (
+    copy_database,
+    delete_product,
+    rebuild_catalog_artifacts,
+)
 from lgd_scraper.discovery import CatalogDiscoveryError, discover_catalog
 from lgd_scraper.s3sync import (
+    delete_media_objects,
     download_checkpoint,
     load_json_object,
     list_admin_runs,
     presigned_artifact_url,
     save_json_object,
+    upload_database_checkpoint,
+    upload_latest_artifacts,
 )
 
 
@@ -496,6 +505,68 @@ def get_product(product_id: str) -> dict[str, Any]:
     if value is None:
         raise HTTPException(404, "Product not found.")
     return value
+
+
+@app.delete("/api/products/{product_id}", dependencies=[Depends(_require_control)])
+def remove_product(
+    product_id: str,
+    delete_media: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Delete one active product and durably replace mutable S3 artifacts."""
+
+    with state_lock:
+        if _process_running():
+            raise HTTPException(409, "Stop the active crawl before deleting products.")
+        if not DATABASE_PATH.exists():
+            raise HTTPException(404, "No catalog database is available.")
+
+        with tempfile.TemporaryDirectory(prefix="catalog-delete-") as temp_dir:
+            candidate = Path(temp_dir) / "catalog.sqlite"
+            copy_database(DATABASE_PATH, candidate)
+            deleted = delete_product(candidate, product_id)
+            if deleted is None:
+                raise HTTPException(404, "Product not found.")
+            try:
+                checkpoint_updated = upload_database_checkpoint(candidate)
+            except Exception as exc:
+                raise HTTPException(
+                    502,
+                    "The product was not deleted because the S3 checkpoint could not be updated.",
+                ) from exc
+
+            DATABASE_PATH.with_name(f"{DATABASE_PATH.name}-wal").unlink(missing_ok=True)
+            DATABASE_PATH.with_name(f"{DATABASE_PATH.name}-shm").unlink(missing_ok=True)
+            candidate.replace(DATABASE_PATH)
+
+        artifact_summary = rebuild_catalog_artifacts(DATABASE_PATH, EXPORT_DIR)
+        latest_artifacts_updated = False
+        artifact_error = None
+        try:
+            latest_artifacts_updated = upload_latest_artifacts(EXPORT_DIR)
+        except Exception as exc:
+            artifact_error = str(exc)
+
+        media_deleted = 0
+        media_error = None
+        if delete_media:
+            try:
+                media_deleted = delete_media_objects(deleted["media_paths"])
+            except Exception as exc:
+                media_error = str(exc)
+
+    return {
+        "deleted": True,
+        "product_id": deleted["id"],
+        "product_name": deleted["name"],
+        "checkpoint_updated": checkpoint_updated,
+        "latest_artifacts_updated": latest_artifacts_updated,
+        "media_requested": delete_media,
+        "media_deleted": media_deleted,
+        "media_error": media_error,
+        "artifact_error": artifact_error,
+        "catalog": artifact_summary["database_counts"],
+        "historical_runs_preserved": True,
+    }
 
 
 @app.get("/api/diagnostics", dependencies=[Depends(_require_control)])

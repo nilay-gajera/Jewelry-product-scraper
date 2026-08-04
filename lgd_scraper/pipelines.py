@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import os
@@ -17,6 +16,7 @@ from scrapy.utils.asyncio import run_in_thread
 from scrapy.utils.defer import deferred_from_coro
 
 from lgd_scraper.s3sync import upload_final_artifacts
+from lgd_scraper.catalog_mutations import write_normalized_csvs
 from lgd_scraper.woocommerce_csv import export_woocommerce_csvs
 
 
@@ -574,39 +574,4 @@ class CatalogWriterPipeline:
 
     def _export_csvs(self) -> None:
         assert self.connection is not None
-        exports = {
-            "products.csv": """
-                SELECT id, name, slug, url, sku, product_type, currency,
-                       price, regular_price, sale_price, stock_status, source
-                FROM products ORDER BY id
-            """,
-            "variations.csv": """
-                SELECT product_id, id, name, sku, price, regular_price,
-                       sale_price, stock_status, image_url, attributes_json
-                FROM variations ORDER BY product_id, id
-            """,
-            "categories.csv": """
-                SELECT id, name, slug, parent_id, description, image_url, product_count
-                FROM categories ORDER BY parent_id, name
-            """,
-            "product-categories.csv": """
-                SELECT product_id, category_id, category_name, category_slug
-                FROM product_categories ORDER BY product_id, category_name
-            """,
-            "attributes.csv": """
-                SELECT id, name, taxonomy, attribute_type, order_by,
-                       has_archives, terms_json
-                FROM attributes ORDER BY name
-            """,
-            "images.csv": """
-                SELECT product_id, variation_id, role, position, source_url,
-                       local_path, alt, width, height, checksum
-                FROM images ORDER BY product_id, variation_id, role, position
-            """,
-        }
-        for filename, query in exports.items():
-            cursor = self.connection.execute(query)
-            with (self.output_dir / filename).open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
-                writer.writerow([column[0] for column in cursor.description])
-                writer.writerows(cursor.fetchall())
+        write_normalized_csvs(self.connection, self.output_dir)

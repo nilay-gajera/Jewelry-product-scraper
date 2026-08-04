@@ -17,6 +17,7 @@ const paths = {
   alert: <><path d="M12 3 2.8 20h18.4Z"/><path d="M12 9v5M12 17.2v.1"/></>,
   check: <path d="m5 12 4 4L19 6"/>,
   refresh: <><path d="M20 6v5h-5"/><path d="M18.5 15.5A8 8 0 1 1 19.8 9"/></>,
+  trash: <><path d="M4 7h16M9 7V4h6v3M6.5 7l1 14h9l1-14"/><path d="M10 11v6M14 11v6"/></>,
 };
 
 export function Icon({ name, size = 18, className = "" }) {

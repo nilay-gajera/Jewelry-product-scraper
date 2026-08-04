@@ -61,6 +61,8 @@ p { color: var(--muted); line-height: 1.55; }
 .button--primary:hover:not(:disabled) { background: var(--emerald-dark); border-color: var(--emerald-dark); }
 .button--danger { color: #fff; background: var(--danger); border-color: var(--danger); }
 .icon-button { width: 36px; height: 36px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border); background: #fff; border-radius: 7px; cursor: pointer; }
+.icon-button--danger { color: var(--danger); }
+.icon-button--danger:hover { color: #fff; background: var(--danger); border-color: var(--danger); }
 .text-button { display: inline-flex; align-items: center; gap: 2px; color: var(--emerald); background: none; border: 0; font-size: .75rem; font-weight: 650; cursor: pointer; }
 
 .control-band { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
@@ -151,6 +153,7 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
 .product-inspector > header, .run-inspector > header { min-height: 61px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
 .product-inspector header h2, .run-inspector header h2 { margin-bottom: 4px; }
 .product-inspector header small, .run-inspector header small { color: var(--muted); font-size: .67rem; }
+.inspector-actions { display: flex; align-items: center; gap: 7px; }
 .inspector-hero { aspect-ratio: 16 / 8.4; display: grid; place-items: center; overflow: hidden; background: #f7f8f7; border-bottom: 1px solid var(--border); }
 .inspector-hero img { width: 100%; height: 100%; object-fit: contain; }
 .inspector-hero span { color: #a0aaaf; }
@@ -187,6 +190,17 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
 .media-grid figcaption { padding: 6px; color: var(--muted); font-size: .6rem; }
 .media-grid--compact { grid-template-columns: repeat(5, 1fr); padding: 0; }
 .raw-data, .live-log { max-height: 520px; margin: 0; padding: 13px; overflow: auto; color: #d8e5e9; background: #111820; font: 10.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dialog-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 20px; background: rgba(12, 19, 24, .52); }
+.confirm-dialog { width: min(430px, 100%); padding: 22px; background: #fff; border: 1px solid #d9dee1; border-radius: 11px; box-shadow: 0 24px 70px rgba(9, 18, 23, .25); }
+.confirm-dialog__icon { width: 42px; height: 42px; display: grid; place-items: center; margin-bottom: 15px; color: var(--danger); background: #fff0f1; border-radius: 50%; }
+.confirm-dialog h2 { margin-bottom: 8px; }
+.confirm-dialog > p { margin-bottom: 18px; font-size: .76rem; }
+.confirm-dialog > p strong { color: var(--ink); }
+.delete-media-option { display: flex; align-items: flex-start; gap: 10px; padding: 12px; background: #fafbfb; border: 1px solid var(--border); border-radius: 7px; cursor: pointer; }
+.delete-media-option input { margin-top: 2px; accent-color: var(--danger); }
+.delete-media-option span { display: grid; gap: 4px; font-size: .72rem; }
+.delete-media-option small { color: var(--muted); font-size: .65rem; }
+.confirm-dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 
 .run-config { margin-bottom: 14px; padding: 15px; }
 .run-config__grid { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; }

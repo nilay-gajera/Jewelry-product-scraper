@@ -106,9 +106,10 @@ Do not commit or paste secret values into source files.
 | `WC_CONSUMER_KEY` | Recommended | Read-only WooCommerce REST API consumer key. |
 | `WC_CONSUMER_SECRET` | Recommended | Read-only WooCommerce REST API secret. |
 
-The IAM identity needs only `s3:GetObject`, `s3:PutObject`, and
-`s3:ListBucket` for the configured prefix. Catalog archives remain private and
-are downloaded through a one-hour presigned URL.
+The IAM identity needs `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket` for
+the configured prefix. Add `s3:DeleteObject` when the optional **delete downloaded
+media** action should be available. Catalog archives remain private and are
+downloaded through a one-hour presigned URL.
 
 WooCommerce must be able to retrieve product images from direct online URLs.
 Prefer a CloudFront/CDN URL in `S3_PUBLIC_BASE_URL`. If the bucket is private and
@@ -130,6 +131,18 @@ The equivalent command-line filter is:
 ```bash
 scrapy crawl catalog -a category_ids=11,12
 ```
+
+### Delete products
+
+Open a product in **Products** and select the trash button. Deletion removes the
+parent, variations, image records, and category/attribute assignments from the
+active catalog. The service replaces the S3 checkpoint and latest import files
+before reporting success, so the product does not return after a Render restart.
+
+Downloaded S3 media is retained by default. Select **Also delete downloaded media
+from S3** when those objects should be removed too. Historical `runs/` archives
+are always preserved for recovery, and deletion is disabled while a crawl is
+active.
 
 ## Safe first run
 
