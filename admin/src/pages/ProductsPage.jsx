@@ -9,6 +9,11 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [type, setType] = useState("");
+  const [categoryId, setCategoryId] = useState("");
+  const [stockStatus, setStockStatus] = useState("");
+  const [coverage, setCoverage] = useState("");
+  const [sort, setSort] = useState("name_asc");
+  const [filterOptions, setFilterOptions] = useState({ categories: [], types: [], stock_statuses: [] });
   const [page, setPage] = useState(1);
   const [data, setData] = useState({ items: [], total: 0, page: 1, page_size: 25 });
   const [selectedId, setSelectedId] = useState(initialProductId);
@@ -22,14 +27,31 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
 
   useEffect(() => {
     let active = true;
+    api("/api/products/options")
+      .then((value) => { if (active) setFilterOptions(value); })
+      .catch(onError);
+    return () => { active = false; };
+  }, [onError, refreshKey]);
+
+  useEffect(() => {
+    let active = true;
     setLoading(true);
-    const params = new URLSearchParams({ q: deferredQuery, product_type: type, page: String(page), page_size: "25" });
+    const params = new URLSearchParams({
+      q: deferredQuery,
+      product_type: type,
+      category_id: categoryId,
+      stock_status: stockStatus,
+      coverage,
+      sort,
+      page: String(page),
+      page_size: "25",
+    });
     api(`/api/products?${params}`)
       .then((value) => { if (active) setData(value); })
       .catch(onError)
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [deferredQuery, type, page, onError, refreshKey]);
+  }, [deferredQuery, type, categoryId, stockStatus, coverage, sort, page, onError, refreshKey]);
 
   useEffect(() => {
     if (!selectedId) { setDetail(null); return; }
@@ -50,6 +72,23 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
   const pages = Math.max(1, Math.ceil(data.total / data.page_size));
   const visibleIds = useMemo(() => data.items.map((product) => String(product.id)), [data.items]);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+  const activeFilterCount = [query, type, categoryId, stockStatus, coverage].filter(Boolean).length;
+
+  function updateFilter(setter, value) {
+    setter(value);
+    setPage(1);
+    setSelectedIds(new Set());
+  }
+
+  function clearFilters() {
+    setQuery("");
+    setType("");
+    setCategoryId("");
+    setStockStatus("");
+    setCoverage("");
+    setPage(1);
+    setSelectedIds(new Set());
+  }
 
   function toggleProduct(productId) {
     setSelectedIds((current) => {
@@ -118,14 +157,21 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
       <div className={detail ? "product-layout product-layout--detail" : "product-layout"}>
         <section className="product-list-panel">
           <div className="product-toolbar">
-            <label className="search-control"><Icon name="search" /><input placeholder="Search by name, SKU, or source ID…" value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); setSelectedIds(new Set()); }} /></label>
-            <label className="select-control"><Icon name="filter" /><select value={type} onChange={(event) => { setType(event.target.value); setPage(1); setSelectedIds(new Set()); }}><option value="">All types</option><option value="simple">Simple</option><option value="variable">Variable</option></select></label>
+            <label className="search-control product-toolbar__search"><Icon name="search" /><input aria-label="Search products" placeholder="Search by name, SKU, or source ID…" value={query} onChange={(event) => updateFilter(setQuery, event.target.value)} /></label>
+            <label className="select-control product-toolbar__sort"><Icon name="filter" /><select aria-label="Sort products" value={sort} onChange={(event) => updateFilter(setSort, event.target.value)}><option value="name_asc">Name: A–Z</option><option value="name_desc">Name: Z–A</option><option value="price_asc">Price: low to high</option><option value="price_desc">Price: high to low</option><option value="quality_desc">Coverage: best first</option><option value="quality_asc">Coverage: needs work first</option><option value="images_desc">Images: most first</option><option value="images_asc">Images: fewest first</option><option value="variations_desc">Variations: most first</option><option value="variations_asc">Variations: fewest first</option></select></label>
+            <div className="product-toolbar__filters" aria-label="Product filters">
+              <label className="select-control"><select aria-label="Filter by product type" value={type} onChange={(event) => updateFilter(setType, event.target.value)}><option value="">All types</option>{filterOptions.types.map((item) => <option key={item.value} value={item.value}>{item.value} ({item.count})</option>)}</select></label>
+              <label className="select-control"><select aria-label="Filter by category" value={categoryId} onChange={(event) => updateFilter(setCategoryId, event.target.value)}><option value="">All categories</option>{filterOptions.categories.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.count})</option>)}</select></label>
+              <label className="select-control"><select aria-label="Filter by stock status" value={stockStatus} onChange={(event) => updateFilter(setStockStatus, event.target.value)}><option value="">All stock states</option>{filterOptions.stock_statuses.map((item) => <option key={item.value} value={item.value}>{item.value} ({item.count})</option>)}</select></label>
+              <label className="select-control"><select aria-label="Filter by data coverage" value={coverage} onChange={(event) => updateFilter(setCoverage, event.target.value)}><option value="">All data coverage</option><option value="complete">Core data complete</option><option value="missing_images">Missing images</option><option value="missing_categories">Missing categories</option><option value="missing_attributes">Missing attributes</option><option value="missing_variations">Missing variations</option></select></label>
+              <button className="filter-reset" disabled={!activeFilterCount} onClick={clearFilters}>{activeFilterCount ? `Clear filters (${activeFilterCount})` : "No filters applied"}</button>
+            </div>
             {selectedIds.size && !crawlActive ? <div className="product-toolbar__bulk"><span><strong>{selectedIds.size}</strong> product{selectedIds.size === 1 ? "" : "s"} selected</span><button onClick={() => setSelectedIds(new Set())}>Clear selection</button><Button icon="trash" tone="danger" onClick={() => setConfirmingBulkDelete(true)}>Delete selected</Button></div> : null}
           </div>
           {crawlActive ? <div className="security-notice"><Icon name="alert" /><span><strong>Catalog crawl in progress.</strong> Product deletion and selection are disabled until the checkpoint is closed safely.</span></div> : null}
           {loading ? <LoadingLine /> : null}
-          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th className="product-select"><input type="checkbox" disabled={crawlActive} checked={allVisibleSelected} onChange={toggleVisibleProducts} aria-label="Select all products on this page" /></th><th>Product</th><th>Type</th><th>Variations</th><th>Images</th><th>Categories</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
-            {data.items.map((product) => { const productId = String(product.id); return <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td className="product-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={crawlActive} checked={selectedIds.has(productId)} onChange={() => toggleProduct(productId)} aria-label={`Select ${product.name || product.id}`} /></td><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>; })}
+          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th className="product-select"><input type="checkbox" disabled={crawlActive} checked={allVisibleSelected} onChange={toggleVisibleProducts} aria-label="Select all products on this page" /></th><th>Product</th><th>Type</th><th>Price</th><th>Variations</th><th>Images</th><th>Categories</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
+            {data.items.map((product) => { const productId = String(product.id); return <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td className="product-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={crawlActive} checked={selectedIds.has(productId)} onChange={() => toggleProduct(productId)} aria-label={`Select ${product.name || product.id}`} /></td><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.price ? `${product.currency ? `${product.currency} ` : ""}${product.price}` : "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>; })}
           </tbody></table></div> : <EmptyState title="No matching products" body="Change the filter or run the scraper to populate products." />}
           <footer className="pagination"><span>{data.total ? `${(page - 1) * data.page_size + 1}–${Math.min(page * data.page_size, data.total)} of ${data.total}` : "0 products"}</span><div><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)} aria-label="Previous page"><Icon name="chevron" className="icon-reverse" /></button><strong>{page}</strong><button disabled={page >= pages} onClick={() => setPage((value) => value + 1)} aria-label="Next page"><Icon name="chevron" /></button></div></footer>
         </section>

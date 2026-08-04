@@ -25,6 +25,7 @@ from lgd_scraper.admin_data import (
     diagnostics,
     effective_settings,
     list_products,
+    product_filter_options,
     persist_settings,
     product_detail,
     secret_presence,
@@ -579,6 +580,10 @@ def refresh_discovery(request: DiscoveryRequest) -> dict[str, Any]:
 def get_products(
     q: str = Query(default="", max_length=200),
     product_type: str = Query(default="", max_length=30),
+    category_id: str = Query(default="", max_length=100),
+    stock_status: str = Query(default="", max_length=30),
+    coverage: str = Query(default="", max_length=40),
+    sort: str = Query(default="name_asc", max_length=40),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
 ) -> dict[str, Any]:
@@ -586,9 +591,18 @@ def get_products(
         DATABASE_PATH,
         query=q.strip(),
         product_type=product_type.strip(),
+        category_id=category_id.strip(),
+        stock_status=stock_status.strip(),
+        coverage=coverage.strip(),
+        sort=sort.strip(),
         page=page,
         page_size=page_size,
     )
+
+
+@app.get("/api/products/options", dependencies=[Depends(_require_control)])
+def get_product_filter_options() -> dict[str, Any]:
+    return product_filter_options(DATABASE_PATH)
 
 
 def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, Any]:

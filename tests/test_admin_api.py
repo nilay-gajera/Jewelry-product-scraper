@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 
 import service
 from lgd_scraper import admin_data
-from lgd_scraper.admin_data import catalog_summary, list_products, product_detail
+from lgd_scraper.admin_data import (
+    catalog_summary,
+    list_products,
+    product_detail,
+    product_filter_options,
+)
 from lgd_scraper.catalog_mutations import (
     build_catalog_archive,
     copy_database,
@@ -162,6 +167,44 @@ def test_admin_data_summary_list_and_detail(tmp_path, monkeypatch):
     assert detail is not None
     assert detail["quality"]["complete"] is True
     assert detail["media"][0]["display_url"].startswith("https://cdn.test/")
+
+
+def test_product_filters_facets_and_sorting(tmp_path):
+    database = tmp_path / "catalog.sqlite"
+    _catalog(database)
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE product_categories (
+            product_id TEXT, category_id TEXT, category_name TEXT, category_slug TEXT
+        );
+        CREATE TABLE product_attributes (product_id TEXT, attribute_key TEXT);
+        INSERT INTO product_categories VALUES ('99', '11', 'Engagement Rings', 'engagement-rings');
+        INSERT INTO product_attributes VALUES ('99', 'metal');
+        """
+    )
+    connection.commit()
+    connection.close()
+    _add_product(database, product_id="100", name="Bianca Ring")
+
+    category = list_products(database, category_id="11")
+    complete = list_products(database, coverage="complete")
+    missing_categories = list_products(database, coverage="missing_categories")
+    expensive_first = list_products(database, sort="price_desc")
+    facets = product_filter_options(database)
+
+    assert [item["id"] for item in category["items"]] == ["99"]
+    assert [item["id"] for item in complete["items"]] == ["99"]
+    assert [item["id"] for item in missing_categories["items"]] == ["100"]
+    assert [item["id"] for item in expensive_first["items"]] == ["99", "100"]
+    assert facets["categories"] == [
+        {"id": "11", "name": "Engagement Rings", "count": 1}
+    ]
+    assert facets["types"] == [
+        {"value": "simple", "count": 1},
+        {"value": "variable", "count": 1},
+    ]
+    assert facets["stock_statuses"] == [{"value": "instock", "count": 2}]
 
 
 def test_catalog_summary_uses_normalized_relationships_without_parsing_every_product(

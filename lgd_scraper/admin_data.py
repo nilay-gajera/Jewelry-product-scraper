@@ -277,6 +277,10 @@ def list_products(
     *,
     query: str = "",
     product_type: str = "",
+    category_id: str = "",
+    stock_status: str = "",
+    coverage: str = "",
+    sort: str = "name_asc",
     page: int = 1,
     page_size: int = 25,
 ) -> dict[str, Any]:
@@ -286,22 +290,77 @@ def list_products(
     where: list[str] = []
     parameters: list[Any] = []
     if query:
-        where.append("(name LIKE ? OR sku LIKE ? OR id LIKE ?)")
+        where.append("(p.name LIKE ? OR p.sku LIKE ? OR p.id LIKE ?)")
         pattern = f"%{query}%"
         parameters.extend([pattern, pattern, pattern])
     if product_type:
-        where.append("product_type = ?")
+        where.append("p.product_type = ?")
         parameters.append(product_type)
+    if category_id:
+        where.append(
+            "EXISTS (SELECT 1 FROM product_categories pc "
+            "WHERE pc.product_id = p.id AND pc.category_id = ?)"
+        )
+        parameters.append(category_id)
+    if stock_status:
+        where.append("p.stock_status = ?")
+        parameters.append(stock_status)
+
+    coverage_filters = {
+        "complete": """
+            EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id)
+            AND EXISTS (SELECT 1 FROM product_categories pc WHERE pc.product_id = p.id)
+            AND EXISTS (SELECT 1 FROM product_attributes pa WHERE pa.product_id = p.id)
+            AND (p.product_type != 'variable' OR EXISTS (
+                SELECT 1 FROM variations v WHERE v.product_id = p.id
+            ))
+        """,
+        "missing_images": "NOT EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id)",
+        "missing_categories": "NOT EXISTS (SELECT 1 FROM product_categories pc WHERE pc.product_id = p.id)",
+        "missing_attributes": "NOT EXISTS (SELECT 1 FROM product_attributes pa WHERE pa.product_id = p.id)",
+        "missing_variations": """
+            p.product_type = 'variable' AND NOT EXISTS (
+                SELECT 1 FROM variations v WHERE v.product_id = p.id
+            )
+        """,
+    }
+    if coverage in coverage_filters:
+        where.append(f"({coverage_filters[coverage]})")
+
+    missing_coverage_count = """
+        (CASE WHEN EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id) THEN 0 ELSE 1 END
+        + CASE WHEN EXISTS (SELECT 1 FROM product_categories pc WHERE pc.product_id = p.id) THEN 0 ELSE 1 END
+        + CASE WHEN EXISTS (SELECT 1 FROM product_attributes pa WHERE pa.product_id = p.id) THEN 0 ELSE 1 END
+        + CASE WHEN p.product_type != 'variable' OR EXISTS (
+            SELECT 1 FROM variations v WHERE v.product_id = p.id
+          ) THEN 0 ELSE 1 END)
+    """
+    name_asc = "COALESCE(NULLIF(p.name, ''), p.id) COLLATE NOCASE ASC, p.id ASC"
+    name_desc = "COALESCE(NULLIF(p.name, ''), p.id) COLLATE NOCASE DESC, p.id DESC"
+    sort_orders = {
+        "name_asc": name_asc,
+        "name_desc": name_desc,
+        "price_asc": f"CASE WHEN NULLIF(p.price, '') IS NULL THEN 1 ELSE 0 END, CAST(p.price AS REAL) ASC, {name_asc}",
+        "price_desc": f"CASE WHEN NULLIF(p.price, '') IS NULL THEN 1 ELSE 0 END, CAST(p.price AS REAL) DESC, {name_asc}",
+        "quality_desc": f"{missing_coverage_count} ASC, {name_asc}",
+        "quality_asc": f"{missing_coverage_count} DESC, {name_asc}",
+        "images_desc": f"(SELECT COUNT(DISTINCT i.source_url) FROM images i WHERE i.product_id = p.id) DESC, {name_asc}",
+        "images_asc": f"(SELECT COUNT(DISTINCT i.source_url) FROM images i WHERE i.product_id = p.id) ASC, {name_asc}",
+        "variations_desc": f"(SELECT COUNT(*) FROM variations v WHERE v.product_id = p.id) DESC, {name_asc}",
+        "variations_asc": f"(SELECT COUNT(*) FROM variations v WHERE v.product_id = p.id) ASC, {name_asc}",
+    }
+    order_by = sort_orders.get(sort, sort_orders["name_asc"])
     clause = f" WHERE {' AND '.join(where)}" if where else ""
     try:
         total = connection.execute(
-            f"SELECT COUNT(*) FROM products{clause}", parameters
+            f"SELECT COUNT(*) FROM products p{clause}", parameters
         ).fetchone()[0]
         rows = connection.execute(
             f"""
-            SELECT id, name, sku, product_type, price, stock_status, source, raw_json
-            FROM products{clause}
-            ORDER BY COALESCE(name, id)
+            SELECT p.id, p.name, p.sku, p.product_type, p.price,
+                   p.stock_status, p.source, p.raw_json
+            FROM products p{clause}
+            ORDER BY {order_by}
             LIMIT ? OFFSET ?
             """,
             [*parameters, page_size, (page - 1) * page_size],
@@ -328,6 +387,7 @@ def list_products(
                     "sku": row["sku"],
                     "type": row["product_type"],
                     "price": row["price"],
+                    "currency": product.get("currency") or "",
                     "stock_status": row["stock_status"],
                     "source": row["source"],
                     "thumbnail": public_media_url(featured) if featured else "",
@@ -342,6 +402,58 @@ def list_products(
                 }
             )
         return {"items": items, "total": total, "page": page, "page_size": page_size}
+    finally:
+        connection.close()
+
+
+def product_filter_options(database_path: Path) -> dict[str, Any]:
+    """Return compact filter facets for the product administration page."""
+
+    empty = {"categories": [], "types": [], "stock_statuses": []}
+    connection = _connect(database_path)
+    if connection is None:
+        return empty
+    try:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        types = connection.execute(
+            """
+            SELECT product_type AS value, COUNT(*) AS count
+            FROM products
+            WHERE COALESCE(product_type, '') != ''
+            GROUP BY product_type ORDER BY product_type COLLATE NOCASE
+            """
+        ).fetchall()
+        stock_statuses = connection.execute(
+            """
+            SELECT stock_status AS value, COUNT(*) AS count
+            FROM products
+            WHERE COALESCE(stock_status, '') != ''
+            GROUP BY stock_status ORDER BY stock_status COLLATE NOCASE
+            """
+        ).fetchall()
+        categories: list[sqlite3.Row] = []
+        if "product_categories" in table_names:
+            categories = connection.execute(
+                """
+                SELECT pc.category_id AS id,
+                       COALESCE(MAX(NULLIF(pc.category_name, '')), pc.category_id) AS name,
+                       COUNT(DISTINCT pc.product_id) AS count
+                FROM product_categories pc
+                JOIN products p ON p.id = pc.product_id
+                GROUP BY pc.category_id
+                ORDER BY name COLLATE NOCASE
+                """
+            ).fetchall()
+        return {
+            "categories": [dict(row) for row in categories],
+            "types": [dict(row) for row in types],
+            "stock_statuses": [dict(row) for row in stock_statuses],
+        }
     finally:
         connection.close()
 
