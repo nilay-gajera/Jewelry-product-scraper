@@ -123,7 +123,7 @@ export function ProductsPage({ initialProductId = "", onError, onDeleted }) {
         </section>
         {selectedId ? <ProductInspector product={detail} onClose={() => setSelectedId("")} onDelete={deleteSelectedProduct} onError={onError} /> : null}
       </div>
-      {confirmingBulkDelete ? <DeleteDialog count={selectedIds.size} deleteMedia={bulkDeleteMedia} setDeleteMedia={setBulkDeleteMedia} busy={bulkDeleting} onCancel={() => setConfirmingBulkDelete(false)} onConfirm={deleteSelectedProducts} /> : null}
+      {confirmingBulkDelete ? <DeleteDialog bulk count={selectedIds.size} deleteMedia={bulkDeleteMedia} setDeleteMedia={setBulkDeleteMedia} busy={bulkDeleting} onCancel={() => setConfirmingBulkDelete(false)} onConfirm={deleteSelectedProducts} /> : null}
     </main>
   );
 }
@@ -173,9 +173,9 @@ function ProductInspector({ product, onClose, onDelete, onError }) {
   );
 }
 
-function DeleteDialog({ productName, count, deleteMedia, setDeleteMedia, busy, onCancel, onConfirm }) {
-  const bulk = count > 1;
-  return <div className="dialog-backdrop"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-product-title"><div className="confirm-dialog__icon"><Icon name="trash" size={22} /></div><h2 id="delete-product-title">Delete {bulk ? `${count} products` : "this product"}?</h2><p>{bulk ? <><strong>{count} selected products</strong> and all of their variations and assignments</> : <><strong>{productName}</strong> and all of its variations and assignments</>} will be removed from the active catalog and S3 checkpoint.</p><label className="delete-media-option"><input type="checkbox" checked={deleteMedia} onChange={(event) => setDeleteMedia(event.target.checked)} /><span><strong>Also delete downloaded media from S3</strong><small>Historical run archives are kept for recovery.</small></span></label><footer><Button disabled={busy} onClick={onCancel}>Cancel</Button><Button icon="trash" tone="danger" disabled={busy} onClick={onConfirm}>{busy ? "Deleting…" : bulk ? `Delete ${count} products` : "Delete product"}</Button></footer></section></div>;
+function DeleteDialog({ productName, bulk = false, count, deleteMedia, setDeleteMedia, busy, onCancel, onConfirm }) {
+  const bulkLabel = `${count} product${count === 1 ? "" : "s"}`;
+  return <div className="dialog-backdrop"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-product-title"><div className="confirm-dialog__icon"><Icon name="trash" size={22} /></div><h2 id="delete-product-title">Delete {bulk ? bulkLabel : "this product"}?</h2><p>{bulk ? <><strong>{bulkLabel} selected</strong> and all of their variations and assignments</> : <><strong>{productName}</strong> and all of its variations and assignments</>} will be removed from the active catalog and S3 checkpoint.</p><label className="delete-media-option"><input type="checkbox" checked={deleteMedia} onChange={(event) => setDeleteMedia(event.target.checked)} /><span><strong>Also delete downloaded media from S3</strong><small>Historical run archives are kept for recovery.</small></span></label><footer><Button disabled={busy} onClick={onCancel}>Cancel</Button><Button icon="trash" tone="danger" disabled={busy} onClick={onConfirm}>{busy ? "Deleting…" : bulk ? `Delete ${bulkLabel}` : "Delete product"}</Button></footer></section></div>;
 }
 
 function Overview({ product }) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 
 import pytest
 from fastapi import HTTPException
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 import service
 from lgd_scraper import admin_data
 from lgd_scraper.admin_data import catalog_summary, list_products, product_detail
-from lgd_scraper.catalog_mutations import copy_database, delete_product
+from lgd_scraper.catalog_mutations import copy_database, delete_product, delete_products
 
 
 def _catalog(path):
@@ -83,6 +84,49 @@ def _catalog(path):
     )
     connection.execute("INSERT INTO categories VALUES ('11')")
     connection.execute("INSERT INTO attributes VALUES ('5')")
+    connection.commit()
+    connection.close()
+
+
+def _add_product(path, product_id="100", name="Bianca Ring"):
+    product = {
+        "_record_type": "product",
+        "id": product_id,
+        "name": name,
+        "sku": f"LGD-{product_id}",
+        "type": "simple",
+        "price": "900",
+        "stock_status": "instock",
+        "source": "store",
+        "categories": [],
+        "attributes": [],
+        "variations": [],
+        "media": [
+            {
+                "role": "featured",
+                "source_url": f"https://source.test/{product_id}.jpg",
+                "local_path": f"products/{product_id}/featured.jpg",
+            }
+        ],
+    }
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            product_id,
+            name,
+            product["sku"],
+            product["type"],
+            product["price"],
+            product["stock_status"],
+            product["source"],
+            json.dumps(product),
+        ),
+    )
+    connection.execute(
+        "INSERT INTO images VALUES (?, ?)",
+        (product_id, f"https://source.test/{product_id}.jpg"),
+    )
     connection.commit()
     connection.close()
 
@@ -184,6 +228,72 @@ def test_service_gracefully_stops_active_crawl(monkeypatch):
     assert current.wait_timeouts == [240]
 
 
+def test_stale_stopping_state_recovers_as_stopped(tmp_path, monkeypatch):
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"state": "stopping", "run_id": "run-1", "finished_at": None}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "STATUS_PATH", status_path)
+    monkeypatch.setattr(service, "process", None)
+    monkeypatch.setattr(service, "save_json_object", lambda *args, **kwargs: True)
+
+    state = service._recover_stale_process_state()
+
+    persisted = json.loads(status_path.read_text(encoding="utf-8"))
+    assert state["state"] == "stopped"
+    assert persisted["state"] == "stopped"
+    assert persisted["finished_at"]
+
+
+def test_forced_stop_kills_process_after_timeout():
+    class FakeProcess:
+        def __init__(self):
+            self.killed = False
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("scrapy", timeout)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    current = FakeProcess()
+
+    service._force_stop_after_timeout(current, timeout=1)
+
+    assert current.killed is True
+
+
+def test_process_watcher_records_requested_stop(tmp_path, monkeypatch):
+    class FinishedProcess:
+        def wait(self, timeout=None):
+            return -15
+
+        def poll(self):
+            return -15
+
+    export = tmp_path / "export"
+    export.mkdir()
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"state": "stopping", "run_id": "run-2"}), encoding="utf-8"
+    )
+    current = FinishedProcess()
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "STATUS_PATH", status_path)
+    monkeypatch.setattr(service, "process", current)
+    monkeypatch.setattr(service, "save_json_object", lambda *args, **kwargs: True)
+
+    service._watch_process(current, "run-2")
+
+    state = json.loads(status_path.read_text(encoding="utf-8"))
+    assert state["state"] == "stopped"
+    assert state["exit_code"] == -15
+
+
 def test_product_deletion_uses_a_copy_and_removes_related_records(tmp_path):
     source = tmp_path / "source.sqlite"
     candidate = tmp_path / "candidate.sqlite"
@@ -203,6 +313,65 @@ def test_product_deletion_uses_a_copy_and_removes_related_records(tmp_path):
     assert connection.execute("SELECT COUNT(*) FROM variations").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM images").fetchone()[0] == 0
     connection.close()
+
+
+def test_bulk_product_deletion_is_transactional_and_deduplicated(tmp_path):
+    database = tmp_path / "catalog.sqlite"
+    _catalog(database)
+    _add_product(database)
+
+    deleted = delete_products(database, ["99", "100", "99", "missing"])
+
+    assert [item["id"] for item in deleted] == ["99", "100"]
+    assert catalog_summary(database)["products"] == 0
+    connection = sqlite3.connect(database)
+    assert connection.execute("SELECT COUNT(*) FROM variations").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM images").fetchone()[0] == 0
+    connection.close()
+
+
+def test_bulk_delete_api_updates_checkpoint_once(tmp_path, monkeypatch):
+    export = tmp_path / "export"
+    export.mkdir()
+    database = export / "catalog.sqlite"
+    _catalog(database)
+    _add_product(database)
+    checkpoint_uploads = []
+    deleted_media = []
+    monkeypatch.setenv("CONTROL_TOKEN", "test-control-token")
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+    monkeypatch.setattr(service, "process", None)
+    monkeypatch.setattr(
+        service,
+        "upload_database_checkpoint",
+        lambda path: checkpoint_uploads.append(path.read_bytes()) or True,
+    )
+    monkeypatch.setattr(service, "upload_latest_artifacts", lambda *args: True)
+    monkeypatch.setattr(
+        service,
+        "delete_media_objects",
+        lambda paths: deleted_media.extend(paths) or len(paths),
+    )
+    monkeypatch.setattr(
+        service,
+        "rebuild_catalog_artifacts",
+        lambda *args: {"database_counts": {"products": 0}},
+    )
+
+    with TestClient(service.app) as client:
+        response = client.post(
+            "/api/products/bulk-delete",
+            headers={"Authorization": "Bearer test-control-token"},
+            json={"product_ids": ["99", "100", "missing"], "delete_media": True},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 2
+    assert response.json()["not_found_ids"] == ["missing"]
+    assert len(checkpoint_uploads) == 1
+    assert deleted_media == ["products/99/ring.jpg", "products/100/featured.jpg"]
+    assert catalog_summary(database)["products"] == 0
 
 
 def test_failed_checkpoint_upload_leaves_active_catalog_untouched(
