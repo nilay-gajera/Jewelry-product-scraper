@@ -7,3 +7,5 @@ work/
 outputs/catalog/
 runtime/
 *.egg-info/
+admin/node_modules/
+admin_dist/

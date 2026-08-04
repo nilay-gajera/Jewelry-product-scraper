@@ -318,6 +318,19 @@ class CatalogWriterPipeline:
             ),
         )
 
+        # A resumed crawl is an authoritative refresh of this product. Remove
+        # relationships that disappeared upstream before inserting this copy,
+        # otherwise old variations/images survive forever in the checkpoint.
+        for table in (
+            "product_categories",
+            "product_attributes",
+            "variations",
+            "images",
+        ):
+            self.connection.execute(
+                f"DELETE FROM {table} WHERE product_id = ?", (product_id,)
+            )
+
         for category in product.get("categories", []):
             category_id = str(
                 category.get("id") or category.get("slug") or category.get("name")

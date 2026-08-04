@@ -136,21 +136,29 @@ def _product_image_urls(
     return result
 
 
-def _variation_image_url(
+def _variation_image_urls(
     product: dict[str, Any],
     variation: dict[str, Any],
     public_base_url: str | None,
-) -> str:
+) -> list[str]:
     variation_id = str(variation.get("id") or "")
+    result: list[str] = []
     for media in product.get("media") or []:
-        if media.get("role") != "variation":
+        if media.get("role") not in {"variation", "variation_gallery"}:
             continue
         if str(media.get("variation_id") or "") != variation_id:
             continue
         url = _media_url(media, public_base_url)
-        if url:
-            return url
-    return str(variation.get("image_url") or "")
+        if url and url not in result:
+            result.append(url)
+    fallback = str(variation.get("image_url") or "")
+    if fallback and fallback not in result:
+        result.insert(0, fallback)
+    for image in variation.get("gallery") or []:
+        url = _media_url(image, public_base_url)
+        if url and url not in result:
+            result.append(url)
+    return result
 
 
 def _category_paths(connection: sqlite3.Connection) -> dict[str, str]:
@@ -305,8 +313,8 @@ def _base_product_row(
         "Published": _published(product.get("status")),
         "Is featured?": int(bool(api.get("featured"))),
         "Visibility in catalog": product.get("catalog_visibility") or "visible",
-        "Short description": api.get("short_description") or product.get("short_description") or "",
-        "Description": api.get("description") or product.get("description") or "",
+        "Short description": api.get("short_description") or product.get("short_description_html") or product.get("short_description") or "",
+        "Description": api.get("description") or product.get("description_html") or product.get("description") or "",
         "Tax status": api.get("tax_status") or "taxable",
         "Tax class": api.get("tax_class") or "",
         "In stock?": _stock_flag(product.get("stock_status")),
@@ -372,8 +380,8 @@ def _variation_row(
             "Regular price": variation.get("regular_price")
             or variation.get("price")
             or "",
-            "Images": _variation_image_url(
-                product, variation, public_base_url
+            "Images": ", ".join(
+                _variation_image_urls(product, variation, public_base_url)
             ),
             "Parent": _product_sku(product),
             "meta:_source_product_id": product.get("id") or "",

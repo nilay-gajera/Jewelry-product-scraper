@@ -232,6 +232,9 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
     shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=EXPORT_DIR)
     upload_error = _read_json(EXPORT_DIR / "s3-upload-error.json")
     successful = exit_code == 0 and not upload_error
+    access_warning = bool(
+        isinstance(summary, dict) and summary.get("access_blocked")
+    )
 
     with state_lock:
         state = _read_state()
@@ -239,12 +242,18 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
             return
         state.update(
             {
-                "state": "completed" if successful else "failed",
+                "state": (
+                    "completed_with_warnings"
+                    if successful and access_warning
+                    else "completed" if successful else "failed"
+                ),
                 "finished_at": _now(),
                 "exit_code": exit_code,
                 "summary": summary,
                 "message": (
-                    "Crawl completed. Review products or download the export."
+                    "Crawl completed, but the source blocked one or more requests. Review diagnostics before importing."
+                    if successful and access_warning
+                    else "Crawl completed. Review products or download the export."
                     if successful
                     else (
                         f"S3 upload failed: {upload_error.get('error')}"

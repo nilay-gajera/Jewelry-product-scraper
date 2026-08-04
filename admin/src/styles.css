@@ -80,6 +80,8 @@ p { color: var(--muted); line-height: 1.55; }
 .status-mark--failed, .status-mark--interrupted { color: var(--danger); }
 .status-mark--failed .status-mark__dot, .status-mark--interrupted .status-mark__dot { background: var(--danger); }
 .status-mark--stopping .status-mark__dot { background: var(--warning); }
+.status-mark--completed_with_warnings { color: var(--warning); }
+.status-mark--completed_with_warnings .status-mark__dot { background: var(--warning); }
 .progress-row { display: grid; grid-template-columns: auto 46px minmax(160px, 1fr) auto auto; align-items: center; gap: 12px; padding: 13px 18px; border-top: 1px solid var(--border); font-size: .72rem; }
 .progress-value { color: var(--emerald); font-weight: 750; }
 .progress-track { height: 7px; overflow: hidden; background: #e4e8ea; border-radius: 10px; }

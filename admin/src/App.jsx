@@ -34,9 +34,14 @@ export function App() {
   }, []);
 
   const refreshStatus = useCallback(async () => {
-    const [nextStatus, nextLogs] = await Promise.all([api("/api/status"), api("/api/logs")]);
+    const [nextStatus, nextLogs, nextProducts] = await Promise.all([
+      api("/api/status"),
+      api("/api/logs"),
+      api("/api/products?page_size=5"),
+    ]);
     setStatus(nextStatus);
     setLogs(nextLogs);
+    setProducts(nextProducts);
   }, []);
 
   const loadInitial = useCallback(async () => {

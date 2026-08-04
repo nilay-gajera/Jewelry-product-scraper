@@ -29,7 +29,7 @@ services:
       - key: AWS_SECRET_ACCESS_KEY
         sync: false
       - key: AWS_REGION
-        value: us-east-1
+        value: us-west-1
       - key: AWS_ENDPOINT_URL
         sync: false
       - key: WC_CONSUMER_KEY

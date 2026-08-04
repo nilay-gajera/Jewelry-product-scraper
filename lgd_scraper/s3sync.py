@@ -254,7 +254,9 @@ class S3ArtifactPipeline:
 
     def _upload_final_artifacts(self) -> None:
         client = s3_client()
-        run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        run_id = os.getenv("SCRAPER_RUN_ID") or datetime.now(UTC).strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
         files = self._artifact_files()
 
         with tempfile.TemporaryDirectory(prefix="lgd-artifacts-") as temp_dir:
