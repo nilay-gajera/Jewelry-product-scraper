@@ -14,6 +14,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 import scrapy
 from scrapy import Request
 from scrapy.http import Response
+from scrapy_playwright.page import PageMethod
 
 
 def _truthy(value: Any) -> bool:
@@ -55,6 +56,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         consumer_secret: str | None = None,
         category_ids: str | Iterable[str] = "",
         resume_existing: str | bool = False,
+        enrichment_mode: str | bool = False,
         *args,
         **kwargs,
     ):
@@ -80,6 +82,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         )
         self.allowed_domains = [urlparse(self.base_url).hostname or ""]
         self.resume_existing = _truthy(resume_existing)
+        self.enrichment_mode = _truthy(enrichment_mode)
         (
             self.existing_product_ids,
             self.refresh_product_ids,
@@ -155,6 +158,10 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             return set(), set()
 
     def start_requests(self):
+        if self.enrichment_mode:
+            yield from self._start_enrichment_requests()
+            return
+
         if self.authenticated:
             product_categories = self.category_ids or [None]
             for category_id in product_categories:
@@ -200,6 +207,59 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 self.parse_attributes_api,
                 meta={"api_kind": "store", "page": 1},
             )
+
+    def _start_enrichment_requests(self):
+        """Refresh saved diamonds and variable products without recrawling the catalog."""
+
+        database_path = Path(self.output_dir).resolve() / "catalog.sqlite"
+        if not database_path.exists():
+            yield {
+                "_record_type": "diagnostic",
+                "kind": "enrichment_catalog_missing",
+                "url": self.base_url,
+                "status": None,
+                "message": "An existing catalog checkpoint is required for enrichment.",
+            }
+            return
+
+        try:
+            connection = sqlite3.connect(
+                f"file:{database_path}?mode=ro", uri=True, timeout=5
+            )
+            try:
+                cursor = connection.execute(
+                    "SELECT raw_json FROM products ORDER BY id"
+                )
+                for (raw_json,) in cursor:
+                    if self.max_products and self.products_scheduled >= self.max_products:
+                        break
+                    try:
+                        product = json.loads(raw_json)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(product, dict) or not product.get("url"):
+                        continue
+                    if not (
+                        product.get("product_family") == "loose_diamond"
+                        or product.get("type") == "variable"
+                        or product.get("variations")
+                    ):
+                        continue
+                    product["_record_type"] = "product"
+                    self.products_scheduled += 1
+                    yield self._page_request(str(product["url"]), product)
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            yield {
+                "_record_type": "diagnostic",
+                "kind": "enrichment_catalog_unreadable",
+                "url": self.base_url,
+                "status": None,
+                "message": f"The existing catalog could not be read: {exc}",
+            }
+            return
+
 
     def parse_products_api(self, response: Response):
         payload = self._json_list(response)
@@ -487,6 +547,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         self._merge_html_tags_and_brands(product, response)
         self._merge_html_attributes(product, response)
         self._merge_html_media(product, response)
+        self._merge_diamond_details(product, response)
 
         embedded = response.css("[data-product_variations]::attr(data-product_variations)").get()
         if embedded and embedded.strip() not in {"", "false"}:
@@ -831,6 +892,232 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "reason": "store_api_loose_diamond_record",
         }
 
+    @staticmethod
+    def _diamond_label(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    @staticmethod
+    def _diamond_number(value: Any) -> float | None:
+        if value in (None, "", "-"):
+            return None
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+        return float(match.group(0)) if match else None
+
+    def _merge_diamond_details(
+        self, product: dict[str, Any], response: Response
+    ) -> None:
+        """Capture rendered diamond specifications omitted by the Store API."""
+
+        if product.get("product_family") != "loose_diamond" and not self.DIAMOND_NAME_RE.match(
+            str(product.get("name") or "").strip()
+        ):
+            return
+
+        label_aliases = {
+            "carat": "carat",
+            "carat weight": "carat",
+            "size mm": "size_mm",
+            "measurements": "size_mm",
+            "measurement": "size_mm",
+            "measurements mm": "size_mm",
+            "cut": "cut",
+            "cut grade": "cut",
+            "color": "color",
+            "colour": "color",
+            "clarity": "clarity",
+            "in the box": "in_the_box",
+            "table depth": "table_depth",
+            "l w ratio": "length_width_ratio",
+            "lw ratio": "length_width_ratio",
+            "length width ratio": "length_width_ratio",
+            "sku": "sku",
+            "stock number": "sku",
+            "growth type": "growth_type",
+            "growth method": "growth_type",
+            "girdle thickness": "girdle_thickness",
+            "girdle": "girdle_thickness",
+            "crown angle": "crown_angle",
+            "pavilion angle": "pavilion_angle",
+            "fluorescence": "fluorescence",
+            "fluorescence intensity": "fluorescence",
+            "polish": "polish",
+            "symmetry": "symmetry",
+            "culet": "culet",
+            "table": "table_percent",
+            "table percent": "table_percent",
+            "table percentage": "table_percent",
+            "depth": "depth_percent",
+            "depth percent": "depth_percent",
+            "depth percentage": "depth_percent",
+            "certificate lab": "certificate_lab",
+            "lab": "certificate_lab",
+        }
+        section_labels = {
+            "diamond details",
+            "additional details",
+            "diamond detail",
+            "additional detail",
+        }
+        values: dict[str, Any] = {}
+
+        def add_value(raw_key: Any, raw_value: Any) -> None:
+            key = label_aliases.get(self._diamond_label(raw_key))
+            if not key or raw_value in (None, "", [], {}):
+                return
+            if isinstance(raw_value, (dict, list)):
+                return
+            text_value = _clean_html(raw_value).strip() or str(raw_value).strip()
+            if not text_value or self._diamond_label(text_value) in section_labels:
+                return
+            values.setdefault(key, text_value)
+
+        def scan_payload(value: Any, depth: int = 0) -> None:
+            if depth > 8:
+                return
+            if isinstance(value, dict):
+                for raw_key, nested in value.items():
+                    add_value(raw_key, nested)
+                    scan_payload(nested, depth + 1)
+            elif isinstance(value, list):
+                for nested in value[:500]:
+                    scan_payload(nested, depth + 1)
+
+        for script_value in response.css(
+            'script[type="application/json"]::text, '
+            'script[id*="next" i]::text, script[id*="nuxt" i]::text'
+        ).getall():
+            try:
+                scan_payload(json.loads(script_value))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        text_values = [
+            _text([value])
+            for value in response.xpath(
+                "//body//text()[not(ancestor::script) and not(ancestor::style)]"
+            ).getall()
+            if _text([value])
+        ]
+        for index, label_text in enumerate(text_values):
+            normalized_label = self._diamond_label(label_text)
+            key = label_aliases.get(normalized_label)
+            if not key or key in values:
+                continue
+            for candidate in text_values[index + 1 : index + 9]:
+                normalized_candidate = self._diamond_label(candidate)
+                if not normalized_candidate or normalized_candidate in section_labels:
+                    continue
+                if normalized_candidate in label_aliases:
+                    break
+                add_value(label_text, candidate)
+                break
+
+        if not values:
+            return
+
+        details = dict(product.get("diamond_details") or {})
+        raw_values = dict(details.get("raw_values") or {})
+        raw_values.update(values)
+        details.update(
+            {
+                "source": "rendered_product_page",
+                "source_url": response.url,
+                "raw_values": raw_values,
+            }
+        )
+        for key in (
+            "cut",
+            "color",
+            "clarity",
+            "growth_type",
+            "girdle_thickness",
+            "fluorescence",
+            "polish",
+            "symmetry",
+            "culet",
+            "sku",
+            "certificate_lab",
+        ):
+            if key in values:
+                details[key] = None if str(values[key]).strip() == "-" else values[key]
+
+        if "carat" in values:
+            details["carat"] = self._diamond_number(values["carat"])
+        if "size_mm" in values:
+            measurements = re.findall(r"\d+(?:\.\d+)?", str(values["size_mm"]))
+            details["size_mm"] = {
+                "raw": values["size_mm"],
+                "length": float(measurements[0]) if len(measurements) > 0 else None,
+                "width": float(measurements[1]) if len(measurements) > 1 else None,
+                "depth": float(measurements[2]) if len(measurements) > 2 else None,
+            }
+        if "table_depth" in values:
+            table_depth = re.findall(r"\d+(?:\.\d+)?", str(values["table_depth"]))
+            details["table_percent"] = (
+                float(table_depth[0]) if len(table_depth) > 0 else None
+            )
+            details["depth_percent"] = (
+                float(table_depth[1]) if len(table_depth) > 1 else None
+            )
+        for key in (
+            "table_percent",
+            "depth_percent",
+            "length_width_ratio",
+            "crown_angle",
+            "pavilion_angle",
+        ):
+            if key in values and key not in details:
+                details[key] = self._diamond_number(values[key])
+        if "in_the_box" in values:
+            details["in_the_box"] = [
+                item.strip()
+                for item in str(values["in_the_box"]).split(",")
+                if item.strip()
+            ]
+
+        product["diamond_details"] = details
+        product["product_family"] = "loose_diamond"
+        self._merge_diamond_detail_attributes(product, details)
+
+    @staticmethod
+    def _merge_diamond_detail_attributes(
+        product: dict[str, Any], details: dict[str, Any]
+    ) -> None:
+        attribute_fields = {
+            "carat": "Carat",
+            "cut": "Cut",
+            "color": "Color",
+            "clarity": "Clarity",
+            "growth_type": "Growth Type",
+            "fluorescence": "Fluorescence",
+            "polish": "Polish",
+            "symmetry": "Symmetry",
+        }
+        attributes = list(product.get("attributes") or [])
+        by_name = {
+            str(attribute.get("name") or "").strip().lower(): attribute
+            for attribute in attributes
+        }
+        for key, name in attribute_fields.items():
+            value = details.get(key)
+            if value in (None, "", [], {}):
+                continue
+            normalized = name.lower()
+            if normalized in by_name:
+                by_name[normalized]["options"] = [str(value)]
+                continue
+            attribute = {
+                "id": f"diamond_{key}",
+                "name": name,
+                "visible": True,
+                "variation": False,
+                "options": [str(value)],
+                "source": "rendered_product_page",
+            }
+            attributes.append(attribute)
+            by_name[normalized] = attribute
+        product["attributes"] = attributes
+
     def _should_enrich_product(self, product: dict[str, Any]) -> bool:
         return bool(
             self.enrich_html
@@ -1018,17 +1305,26 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             if "gallery" in key and ("image" in key or "variation" in key):
                 values.append(entry.get("value"))
 
-        def scan_extension(value: Any) -> None:
-            if not isinstance(value, dict):
+        def scan_gallery_fields(value: Any, depth: int = 0) -> None:
+            if depth > 8:
                 return
-            for key, nested in value.items():
-                normalized = str(key).lower()
-                if any(token in normalized for token in ("gallery", "images", "media")):
-                    values.append(nested)
-                elif isinstance(nested, dict):
-                    scan_extension(nested)
+            if isinstance(value, dict):
+                for key, nested in value.items():
+                    normalized = str(key).lower()
+                    if any(token in normalized for token in ("gallery", "images", "media")):
+                        values.append(nested)
+                    if isinstance(nested, (dict, list, tuple)):
+                        scan_gallery_fields(nested, depth + 1)
+                    elif isinstance(nested, str) and nested.strip().startswith(("[", "{")):
+                        try:
+                            scan_gallery_fields(json.loads(html.unescape(nested)), depth + 1)
+                        except json.JSONDecodeError:
+                            pass
+            elif isinstance(value, (list, tuple)):
+                for nested in value[:500]:
+                    scan_gallery_fields(nested, depth + 1)
 
-        scan_extension(raw.get("extensions") or {})
+        scan_gallery_fields(raw)
         return values
 
     def _variation_gallery_ids(self, raw: dict[str, Any]) -> list[str]:
@@ -1689,6 +1985,12 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                         "wait_until": "domcontentloaded",
                         "timeout": 45_000,
                     },
+                    "playwright_page_methods": [
+                        PageMethod(
+                            "wait_for_timeout",
+                            int(os.getenv("SCRAPER_RENDER_WAIT_MS", "2500")),
+                        )
+                    ],
                 }
             )
         return Request(

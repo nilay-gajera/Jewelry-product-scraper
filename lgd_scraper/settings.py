@@ -79,12 +79,22 @@ FEED_EXPORT_ENCODING = "utf-8"
 LOG_LEVEL = os.getenv("SCRAPER_LOG_LEVEL", "INFO")
 TELNETCONSOLE_ENABLED = False
 
-# Enabled only for requests whose meta["playwright"] is true.
-DOWNLOAD_HANDLERS = {
-    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+# Do not initialize Chromium/download handlers for the ordinary WooCommerce
+# catalog crawl. On Render's 512 MB Free instance, merely starting both
+# handlers consumes a meaningful part of the container memory even though no
+# request has meta["playwright"]. The separate enrichment task opts in.
+PLAYWRIGHT_ENABLED = os.getenv("SCRAPER_USE_PLAYWRIGHT", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
 }
-TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
-PLAYWRIGHT_BROWSER_TYPE = "chromium"
-PLAYWRIGHT_MAX_PAGES_PER_CONTEXT = 2
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 45_000
+if PLAYWRIGHT_ENABLED:
+    DOWNLOAD_HANDLERS = {
+        "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+        "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+    }
+    TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+    PLAYWRIGHT_BROWSER_TYPE = "chromium"
+    PLAYWRIGHT_MAX_PAGES_PER_CONTEXT = 1
+    PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 45_000

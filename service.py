@@ -317,6 +317,7 @@ def _configure_crawl_environment(config: dict[str, Any], run_id: str) -> dict[st
             "SCRAPER_RETRY_TIMES": str(config["retry_times"]),
             "SCRAPER_DOWNLOAD_MEDIA": "1" if config["download_media"] else "0",
             "SCRAPER_OBEY_ROBOTS": "1" if config["obey_robots"] else "0",
+            "SCRAPER_USE_PLAYWRIGHT": "1" if config.get("mode") == "enrich" else "0",
         }
     )
     proxy = environment.get("SCRAPER_PROXY_URL")
