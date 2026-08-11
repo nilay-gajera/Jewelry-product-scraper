@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { api, downloadExport, getToken, setToken } from "./api.js";
+import { api, downloadMasterExport, getToken, setToken } from "./api.js";
 import { AppShell } from "./components/AppShell.jsx";
 import { Login } from "./components/Login.jsx";
 import { ExportsPage } from "./pages/ExportsPage.jsx";
@@ -103,7 +103,7 @@ export function App() {
 
   async function download() {
     setBusy(true);
-    try { await downloadExport(); } catch (error) { showError(error); } finally { setBusy(false); }
+    try { await downloadMasterExport(); } catch (error) { showError(error); } finally { setBusy(false); }
   }
 
   async function authenticatedLogin() {

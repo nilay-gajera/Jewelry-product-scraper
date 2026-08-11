@@ -49,6 +49,7 @@ from lgd_scraper.s3sync import (
     upload_database_checkpoint,
     upload_latest_artifacts,
 )
+from lgd_scraper.woocommerce_csv import MASTER_FILENAME, export_woocommerce_csvs
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -774,6 +775,44 @@ def download() -> dict[str, str]:
     if not archive.exists():
         raise HTTPException(404, "No export is available.")
     return {"url": "/api/download-local"}
+
+
+@app.get("/api/download-master", dependencies=[Depends(_require_control)])
+def download_master():
+    """Build one current WooCommerce CSV from the restored SQLite checkpoint."""
+
+    with state_lock:
+        if _process_running():
+            raise HTTPException(
+                409,
+                "Wait for the active crawl to stop before building the master export.",
+            )
+        if not DATABASE_PATH.exists():
+            raise HTTPException(404, "No catalog checkpoint is available.")
+
+        connection = sqlite3.connect(
+            f"file:{DATABASE_PATH}?mode=ro", uri=True
+        )
+        try:
+            counts = export_woocommerce_csvs(
+                connection,
+                EXPORT_DIR,
+                public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
+            )
+        finally:
+            connection.close()
+
+    target = EXPORT_DIR / MASTER_FILENAME
+    return FileResponse(
+        target,
+        filename=MASTER_FILENAME,
+        media_type="text/csv",
+        headers={
+            "X-WooCommerce-Parent-Rows": str(counts["parent_rows"]),
+            "X-WooCommerce-Variation-Rows": str(counts["variation_rows"]),
+            "X-WooCommerce-Master-Rows": str(counts["master_rows"]),
+        },
+    )
 
 
 @app.get("/api/download-local", dependencies=[Depends(_require_control)])

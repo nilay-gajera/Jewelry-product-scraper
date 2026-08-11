@@ -768,3 +768,55 @@ def test_admin_api_requires_token_and_returns_real_catalog(tmp_path, monkeypatch
     assert remaining_products.json()["total"] == 0
     assert len(checkpoint_uploads) == 1
     assert media_deletions == ["products/99/ring.jpg"]
+
+
+def test_download_master_rebuilds_from_current_database_checkpoint(
+    tmp_path, monkeypatch
+):
+    export = tmp_path / "export"
+    export.mkdir()
+    database = export / "catalog.sqlite"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE products (id TEXT PRIMARY KEY, raw_json TEXT NOT NULL);
+        CREATE TABLE categories (
+            id TEXT PRIMARY KEY, name TEXT, parent_id TEXT
+        );
+        CREATE TABLE product_categories (
+            product_id TEXT, category_id TEXT, category_name TEXT
+        );
+        """
+    )
+    product = {
+        "id": "99",
+        "name": "Current Checkpoint Ring",
+        "sku": "RING-99",
+        "type": "simple",
+        "categories": [{"id": "11", "name": "Rings"}],
+        "attributes": [],
+        "variations": [],
+        "media": [],
+    }
+    connection.execute(
+        "INSERT INTO products VALUES (?, ?)",
+        (product["id"], json.dumps(product)),
+    )
+    connection.commit()
+    connection.close()
+
+    monkeypatch.setenv("CONTROL_TOKEN", "test-control-token")
+    monkeypatch.setattr(service, "EXPORT_DIR", export)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+    monkeypatch.setattr(service, "process", None)
+
+    with TestClient(service.app) as client:
+        response = client.get(
+            "/api/download-master",
+            headers={"Authorization": "Bearer test-control-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["x-woocommerce-master-rows"] == "1"
+    assert "Current Checkpoint Ring" in response.text
+    assert (export / "woocommerce-master.csv").exists()

@@ -53,3 +53,16 @@ export async function downloadExport() {
   link.click();
   URL.revokeObjectURL(blobUrl);
 }
+
+export async function downloadMasterExport() {
+  const response = await fetch("/api/download-master", {
+    headers: { Authorization: `Bearer ${controlToken}` },
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const blobUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = "woocommerce-master.csv";
+  link.click();
+  URL.revokeObjectURL(blobUrl);
+}

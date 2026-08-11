@@ -5,9 +5,16 @@ import json
 import re
 import sqlite3
 from collections import OrderedDict
-from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
+
+
+MASTER_FILENAME = "woocommerce-master.csv"
+LEGACY_WOOCOMMERCE_FILENAMES = (
+    "woocommerce-products.csv",
+    "woocommerce-parents.csv",
+    "woocommerce-variations.csv",
+)
 
 
 BASE_COLUMNS = [
@@ -50,6 +57,8 @@ BASE_COLUMNS = [
     "meta:_source_product_id",
     "meta:_source_variation_id",
     "meta:_source_url",
+    "meta:_variation_gallery_urls",
+    "meta:_s3_media_paths",
 ]
 
 
@@ -146,6 +155,23 @@ def _product_image_urls(
     return result
 
 
+def _media_paths(
+    product: dict[str, Any], variation_id: str | None = None
+) -> list[str]:
+    result: list[str] = []
+    for media in product.get("media") or []:
+        media_variation_id = str(media.get("variation_id") or "")
+        if variation_id is None:
+            if media.get("role") in {"variation", "variation_gallery"}:
+                continue
+        elif media_variation_id != str(variation_id):
+            continue
+        path = str(media.get("local_path") or "").lstrip("/")
+        if path and path not in result:
+            result.append(path)
+    return result
+
+
 def _variation_image_urls(
     product: dict[str, Any],
     variation: dict[str, Any],
@@ -215,6 +241,37 @@ def _product_categories(
         if value and value not in values:
             values.append(value)
     return ", ".join(values)
+
+
+def _raw_product_categories(
+    product: dict[str, Any], category_paths: dict[str, str]
+) -> str:
+    values: list[str] = []
+    for category in product.get("categories") or []:
+        if not isinstance(category, dict):
+            value = str(category or "").strip()
+        else:
+            category_id = str(category.get("id") or "")
+            value = (
+                category_paths.get(category_id)
+                or str(category.get("name") or category.get("slug") or "").strip()
+            )
+        if value and value not in values:
+            values.append(value)
+    return ", ".join(values)
+
+
+def _meta_value(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+def _diamond_details(product: dict[str, Any]) -> dict[str, Any]:
+    details = product.get("diamond_details")
+    return details if isinstance(details, dict) else {}
 
 
 def _attribute_defs(product: dict[str, Any]) -> list[dict[str, Any]]:
@@ -315,6 +372,10 @@ def _base_product_row(
     variations = product.get("variations") or []
     product_type = "variable" if variations else str(product.get("type") or "simple")
 
+    categories = _product_categories(connection, product_id, category_paths)
+    if not categories:
+        categories = _raw_product_categories(product, category_paths)
+
     return {
         "ID": "",
         "Type": product_type,
@@ -339,9 +400,7 @@ def _base_product_row(
         "Purchase note": api.get("purchase_note") or "",
         "Sale price": product.get("sale_price") or "",
         "Regular price": product.get("regular_price") or product.get("price") or "",
-        "Categories": _product_categories(
-            connection, product_id, category_paths
-        ),
+        "Categories": categories,
         "Tags": ", ".join(tag_names),
         "Shipping class": api.get("shipping_class") or "",
         "Images": ", ".join(images),
@@ -357,6 +416,8 @@ def _base_product_row(
         "meta:_source_product_id": product_id,
         "meta:_source_variation_id": "",
         "meta:_source_url": product.get("url") or "",
+        "meta:_variation_gallery_urls": "",
+        "meta:_s3_media_paths": " | ".join(_media_paths(product)),
     }
 
 
@@ -370,6 +431,8 @@ def _variation_row(
     row = {
         column: "" for column in BASE_COLUMNS
     }
+    variation_id = str(variation.get("id") or "")
+    variation_images = _variation_image_urls(product, variation, public_base_url)
     row.update(
         {
             "Type": "variation",
@@ -390,13 +453,15 @@ def _variation_row(
             "Regular price": variation.get("regular_price")
             or variation.get("price")
             or "",
-            "Images": ", ".join(
-                _variation_image_urls(product, variation, public_base_url)
-            ),
+            "Images": ", ".join(variation_images),
             "Parent": _product_sku(product),
             "meta:_source_product_id": product.get("id") or "",
             "meta:_source_variation_id": variation.get("id") or "",
             "meta:_source_url": product.get("url") or "",
+            "meta:_variation_gallery_urls": " | ".join(variation_images[1:]),
+            "meta:_s3_media_paths": " | ".join(
+                _media_paths(product, variation_id)
+            ),
         }
     )
     for index, definition in enumerate(definitions, 1):
@@ -415,17 +480,25 @@ def export_woocommerce_csvs(
     output_dir: Path,
     public_base_url: str | None = None,
 ) -> dict[str, int]:
-    """Create WooCommerce core-importer CSVs from normalized catalog data."""
+    """Create one WooCommerce core-importer master CSV.
+
+    The file contains simple products, variable parents, and variation rows in
+    parent-first order.  Arbitrary diamond details are retained as importable
+    ``meta:_diamond_*`` columns.
+    """
 
     category_paths = _category_paths(connection)
     maximum_attributes = 0
+    diamond_detail_keys: OrderedDict[str, str] = OrderedDict()
     for (raw_json,) in connection.execute(
         "SELECT raw_json FROM products ORDER BY id"
     ):
-        maximum_attributes = max(
-            maximum_attributes,
-            len(_attribute_defs(json.loads(raw_json))),
-        )
+        product = json.loads(raw_json)
+        maximum_attributes = max(maximum_attributes, len(_attribute_defs(product)))
+        for name in _diamond_details(product):
+            key = _slug(name).replace("-", "_")
+            if key and key not in diamond_detail_keys:
+                diamond_detail_keys[key] = str(name)
     attribute_columns: list[str] = []
     for index in range(1, maximum_attributes + 1):
         attribute_columns.extend(
@@ -437,58 +510,65 @@ def export_woocommerce_csvs(
                 f"Attribute {index} global",
             ]
         )
-    columns = BASE_COLUMNS + attribute_columns
+    diamond_columns = [
+        f"meta:_diamond_{key}" for key in diamond_detail_keys
+    ]
+    columns = BASE_COLUMNS + attribute_columns + diamond_columns
 
     parent_count = 0
     variation_count = 0
-    filenames = (
-        "woocommerce-products.csv",
-        "woocommerce-parents.csv",
-        "woocommerce-variations.csv",
-    )
-    with ExitStack() as stack:
-        writers: dict[str, csv.DictWriter] = {}
-        for filename in filenames:
-            handle = stack.enter_context(
-                (output_dir / filename).open(
-                    "w", encoding="utf-8-sig", newline=""
-                )
-            )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for filename in LEGACY_WOOCOMMERCE_FILENAMES:
+        (output_dir / filename).unlink(missing_ok=True)
+
+    target = output_dir / MASTER_FILENAME
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(
                 handle, fieldnames=columns, extrasaction="ignore"
             )
             writer.writeheader()
-            writers[filename] = writer
-
-        for (raw_json,) in connection.execute(
-            "SELECT raw_json FROM products ORDER BY id"
-        ):
-            product = json.loads(raw_json)
-            definitions = _attribute_defs(product)
-            parent = _base_product_row(
-                connection, product, category_paths, public_base_url
-            )
-            for index, definition in enumerate(definitions, 1):
-                parent[f"Attribute {index} name"] = definition["name"]
-                parent[f"Attribute {index} value(s)"] = ", ".join(
-                    definition["values"]
+            for (raw_json,) in connection.execute(
+                "SELECT raw_json FROM products ORDER BY id"
+            ):
+                product = json.loads(raw_json)
+                definitions = _attribute_defs(product)
+                parent = _base_product_row(
+                    connection, product, category_paths, public_base_url
                 )
-                parent[f"Attribute {index} default"] = definition["default"]
-                parent[f"Attribute {index} visible"] = definition["visible"]
-                parent[f"Attribute {index} global"] = definition["global"]
-            writers["woocommerce-products.csv"].writerow(parent)
-            writers["woocommerce-parents.csv"].writerow(parent)
-            parent_count += 1
+                for index, definition in enumerate(definitions, 1):
+                    parent[f"Attribute {index} name"] = definition["name"]
+                    parent[f"Attribute {index} value(s)"] = ", ".join(
+                        definition["values"]
+                    )
+                    parent[f"Attribute {index} default"] = definition["default"]
+                    parent[f"Attribute {index} visible"] = definition["visible"]
+                    parent[f"Attribute {index} global"] = definition["global"]
+                details = _diamond_details(product)
+                normalized_details = {
+                    _slug(key).replace("-", "_"): value
+                    for key, value in details.items()
+                }
+                for key in diamond_detail_keys:
+                    parent[f"meta:_diamond_{key}"] = _meta_value(
+                        normalized_details.get(key)
+                    )
+                writer.writerow(parent)
+                parent_count += 1
 
-            for variation in product.get("variations") or []:
-                variation_row = _variation_row(
-                    product, variation, definitions, public_base_url
-                )
-                writers["woocommerce-products.csv"].writerow(variation_row)
-                writers["woocommerce-variations.csv"].writerow(variation_row)
-                variation_count += 1
+                for variation in product.get("variations") or []:
+                    variation_row = _variation_row(
+                        product, variation, definitions, public_base_url
+                    )
+                    writer.writerow(variation_row)
+                    variation_count += 1
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
     return {
         "parent_rows": parent_count,
         "variation_rows": variation_count,
+        "master_rows": parent_count + variation_count,
     }

@@ -193,9 +193,7 @@ outputs/catalog/
 ├── product-categories.csv
 ├── attributes.csv
 ├── images.csv
-├── woocommerce-products.csv
-├── woocommerce-parents.csv
-├── woocommerce-variations.csv
+├── woocommerce-master.csv
 ├── crawl-summary.json
 └── media/
     └── products/<product-id>/
@@ -208,14 +206,11 @@ SCRAPER_MEDIA_STORE=outputs/run-2/media \
 scrapy crawl catalog -a output_dir=outputs/run-2
 ```
 
-### WooCommerce import order
+### WooCommerce master import
 
-The export follows WooCommerce's built-in Product CSV Importer schema.
-
-1. Import `woocommerce-parents.csv`.
-2. Import `woocommerce-variations.csv`.
-3. Alternatively, test `woocommerce-products.csv` on staging; it contains both
-   parent and variation rows in the correct order.
+The export follows WooCommerce's built-in Product CSV Importer schema. Import
+`woocommerce-master.csv` once; it contains simple products, variable parents,
+and their variation rows in parent-first order.
 
 Parent and variation SKUs are generated when the source lacks one. Category
 hierarchies use `Parent > Child`, variation rows reference the parent SKU, the
@@ -228,9 +223,7 @@ Always test a small import on a staging store before importing the full catalog.
 s3://<bucket>/<prefix>/
 ├── checkpoints/catalog.sqlite
 ├── latest/catalog-export.zip
-├── latest/woocommerce-products.csv
-├── latest/woocommerce-parents.csv
-├── latest/woocommerce-variations.csv
+├── latest/woocommerce-master.csv
 ├── media/products/<product-id>/
 └── runs/<timestamp>/
 ```

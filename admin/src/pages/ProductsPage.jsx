@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
 
-import { api, downloadExport } from "../api.js";
+import { api, downloadMasterExport } from "../api.js";
 import { Icon } from "../icons.jsx";
 import { Button, EmptyState, LoadingLine, formatDate } from "../components/Ui.jsx";
 import { ProductThumb } from "./OverviewPage.jsx";
@@ -153,7 +153,7 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
 
   return (
     <main className="page page--products">
-      <header className="page-header"><div><h1>Products</h1><p>Inspect normalized products, variations, media, attributes, and raw source records.</p></div><Button icon="download" tone="primary" onClick={() => downloadExport().catch(onError)}>Download export</Button></header>
+      <header className="page-header"><div><h1>Products</h1><p>Inspect normalized products, variations, media, attributes, and raw source records.</p></div><Button icon="download" tone="primary" onClick={() => downloadMasterExport().catch(onError)}>Download master CSV</Button></header>
       <div className={detail ? "product-layout product-layout--detail" : "product-layout"}>
         <section className="product-list-panel">
           <div className="product-toolbar">

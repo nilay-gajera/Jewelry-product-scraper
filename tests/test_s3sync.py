@@ -36,7 +36,7 @@ def test_uploads_checkpoint_final_archive_and_manifest(tmp_path, monkeypatch):
     database.execute("INSERT INTO products (id) VALUES ('99')")
     database.commit()
     database.close()
-    (tmp_path / "woocommerce-products.csv").write_text(
+    (tmp_path / "woocommerce-master.csv").write_text(
         "Type,SKU\nvariable,LGD-P-99\n", encoding="utf-8"
     )
 
@@ -48,7 +48,7 @@ def test_uploads_checkpoint_final_archive_and_manifest(tmp_path, monkeypatch):
     keys = [key for _, key, _ in fake.uploads]
     assert "exports/jewelry/checkpoints/catalog.sqlite" in keys
     assert "exports/jewelry/latest/catalog.sqlite" in keys
-    assert "exports/jewelry/latest/woocommerce-products.csv" in keys
+    assert "exports/jewelry/latest/woocommerce-master.csv" in keys
     assert "exports/jewelry/latest/catalog-export.zip" in keys
     assert "exports/jewelry/latest/s3-upload.json" in keys
     assert (tmp_path / "s3-upload.json").exists()

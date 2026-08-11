@@ -5,6 +5,8 @@ import json
 import sqlite3
 
 from lgd_scraper.woocommerce_csv import (
+    LEGACY_WOOCOMMERCE_FILENAMES,
+    MASTER_FILENAME,
     _media_url,
     _variation_sku,
     export_woocommerce_csvs,
@@ -79,6 +81,10 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
         "default_attributes": [
             {"name": "Metal", "option": "14K White Gold"}
         ],
+        "diamond_details": {
+            "Carat": "1.96",
+            "Growth Type": "HPHT",
+        },
         "media": [
             {
                 "role": "featured",
@@ -129,12 +135,17 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
         public_base_url="https://cdn.example.test/catalog/media",
     )
 
-    with (tmp_path / "woocommerce-products.csv").open(
+    with (tmp_path / MASTER_FILENAME).open(
         encoding="utf-8-sig", newline=""
     ) as handle:
         rows = list(csv.DictReader(handle))
 
-    assert counts == {"parent_rows": 1, "variation_rows": 1}
+    assert counts == {
+        "parent_rows": 1,
+        "variation_rows": 1,
+        "master_rows": 2,
+    }
+    assert not any((tmp_path / name).exists() for name in LEGACY_WOOCOMMERCE_FILENAMES)
     assert rows[0]["Type"] == "variable"
     assert rows[0]["SKU"] == "LGD-P-99"
     assert rows[0]["Categories"] == "Rings > Engagement Rings"
@@ -147,6 +158,9 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
     )
     assert rows[0]["Attribute 1 default"] == "14K White Gold"
     assert rows[0]["Attribute 1 global"] == "1"
+    assert rows[0]["meta:_diamond_carat"] == "1.96"
+    assert rows[0]["meta:_diamond_growth_type"] == "HPHT"
+    assert rows[0]["meta:_s3_media_paths"] == "products/99/ring.jpg"
 
     assert rows[1]["Type"] == "variation"
     assert rows[1]["Parent"] == "LGD-P-99"
@@ -156,3 +170,43 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
         "https://cdn.example.test/catalog/media/products/99/ring-white.jpg, "
         "https://cdn.example.test/catalog/media/products/99/ring-white-side.jpg"
     )
+    assert rows[1]["meta:_variation_gallery_urls"] == (
+        "https://cdn.example.test/catalog/media/products/99/ring-white-side.jpg"
+    )
+    assert rows[1]["meta:_s3_media_paths"] == (
+        "products/99/ring-white.jpg | products/99/ring-white-side.jpg"
+    )
+
+
+def test_uses_raw_product_categories_when_normalized_assignment_is_missing(tmp_path):
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE products (id TEXT PRIMARY KEY, raw_json TEXT NOT NULL);
+        CREATE TABLE categories (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT);
+        CREATE TABLE product_categories (
+            product_id TEXT, category_id TEXT, category_name TEXT
+        );
+        """
+    )
+    product = {
+        "id": "diamond-1",
+        "name": "Loose Diamond",
+        "type": "simple",
+        "categories": [{"id": "diamond", "name": "Lab Grown Diamonds"}],
+        "attributes": [],
+        "variations": [],
+        "media": [],
+    }
+    connection.execute(
+        "INSERT INTO products VALUES (?, ?)",
+        (product["id"], json.dumps(product)),
+    )
+
+    export_woocommerce_csvs(connection, tmp_path)
+
+    with (tmp_path / MASTER_FILENAME).open(
+        encoding="utf-8-sig", newline=""
+    ) as handle:
+        row = next(csv.DictReader(handle))
+    assert row["Categories"] == "Lab Grown Diamonds"

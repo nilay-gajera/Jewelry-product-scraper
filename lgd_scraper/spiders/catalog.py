@@ -1281,7 +1281,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         for image_item in images:
             url = str(image_item.get("source_url") or "")
             if url and url != featured_url:
-                unique[url] = image_item
+                existing = unique.get(url)
+                if existing is None or sum(
+                    value not in (None, "") for value in image_item.values()
+                ) > sum(
+                    value not in (None, "") for value in existing.values()
+                ):
+                    unique[url] = image_item
         gallery = list(unique.values())
         for position, image_item in enumerate(gallery):
             image_item["position"] = position

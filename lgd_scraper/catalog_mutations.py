@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
 import tempfile
 import zipfile
@@ -265,7 +266,11 @@ def rebuild_catalog_artifacts(database_path: Path, output_dir: Path) -> dict[str
         write_normalized_csvs(connection, output_dir)
         write_jsonl_exports(connection, output_dir)
 
-        woocommerce_counts = export_woocommerce_csvs(connection, output_dir)
+        woocommerce_counts = export_woocommerce_csvs(
+            connection,
+            output_dir,
+            public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
+        )
         database_counts = {
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in COUNT_TABLES
