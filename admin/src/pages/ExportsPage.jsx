@@ -3,7 +3,7 @@ import { Icon } from "../icons.jsx";
 import { Button } from "../components/Ui.jsx";
 
 const files = [
-  ["woocommerce-master.csv", "Simple products, variable parents, variations, categories, attributes, diamond metadata, and image URLs"],
+  ["woocommerce-master.csv", "Simple products, variable parents, variations, categories, attributes, dynamic metadata, and S3/CloudFront image URLs"],
 ];
 
 export function ExportsPage({ status, settings, onError }) {

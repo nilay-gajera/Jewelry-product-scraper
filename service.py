@@ -49,7 +49,11 @@ from lgd_scraper.s3sync import (
     upload_database_checkpoint,
     upload_latest_artifacts,
 )
-from lgd_scraper.woocommerce_csv import MASTER_FILENAME, export_woocommerce_csvs
+from lgd_scraper.woocommerce_csv import (
+    MASTER_FILENAME,
+    WooCommerceExportValidationError,
+    export_woocommerce_csvs,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -794,11 +798,21 @@ def download_master():
             f"file:{DATABASE_PATH}?mode=ro", uri=True
         )
         try:
-            counts = export_woocommerce_csvs(
-                connection,
-                EXPORT_DIR,
-                public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
-            )
+            try:
+                counts = export_woocommerce_csvs(
+                    connection,
+                    EXPORT_DIR,
+                    public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
+                )
+            except WooCommerceExportValidationError as exc:
+                raise HTTPException(
+                    422,
+                    {
+                        "message": "Master CSV failed WooCommerce preflight.",
+                        "errors": exc.errors[:100],
+                        "error_count": len(exc.errors),
+                    },
+                ) from exc
         finally:
             connection.close()
 
