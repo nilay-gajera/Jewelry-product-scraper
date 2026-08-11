@@ -46,12 +46,7 @@ export async function downloadExport() {
     headers: { Authorization: `Bearer ${controlToken}` },
   });
   if (!response.ok) throw new Error(await response.text());
-  const blobUrl = URL.createObjectURL(await response.blob());
-  const link = document.createElement("a");
-  link.href = blobUrl;
-  link.download = "catalog-export.zip";
-  link.click();
-  URL.revokeObjectURL(blobUrl);
+  await saveResponseAsFile(response, "catalog-export.zip");
 }
 
 export async function downloadMasterExport() {
@@ -59,10 +54,20 @@ export async function downloadMasterExport() {
     headers: { Authorization: `Bearer ${controlToken}` },
   });
   if (!response.ok) throw new Error(await response.text());
+  await saveResponseAsFile(response, "woocommerce-master.csv");
+}
+
+async function saveResponseAsFile(response, fallbackName) {
   const blobUrl = URL.createObjectURL(await response.blob());
   const link = document.createElement("a");
   link.href = blobUrl;
-  link.download = "woocommerce-master.csv";
+  link.download = fallbackName;
+  link.style.display = "none";
+  document.body.appendChild(link);
   link.click();
-  URL.revokeObjectURL(blobUrl);
+  link.remove();
+
+  // Some browsers begin reading the object URL after the click handler exits.
+  // Revoking it immediately can silently cancel a large download.
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
 }
