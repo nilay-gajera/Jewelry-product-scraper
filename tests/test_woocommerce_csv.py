@@ -21,7 +21,8 @@ def test_placeholder_cdn_is_not_written_to_woocommerce_images():
 
     assert _media_url(
         media, "https://your-cdn-domain/jewelry-product-scraper/media"
-    ) == "https://source.test/ring.jpg"
+    ) == ""
+    assert _media_url(media, None) == ""
 
 
 def test_variation_inheriting_parent_sku_gets_a_unique_import_sku():
@@ -85,6 +86,10 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
             "Carat": "1.96",
             "Growth Type": "HPHT",
         },
+        "meta_data": [
+            {"key": "custom_badge", "value": "Made to order"},
+            {"key": "complex_config", "value": {"enabled": True}},
+        ],
         "media": [
             {
                 "role": "featured",
@@ -117,11 +122,22 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
                 "stock_status": "instock",
                 "visible": True,
                 "image_url": "https://source.test/ring-white.jpg",
+                "meta_data": [
+                    {"key": "custom_finish_note", "value": "Mirror"}
+                ],
+                "raw": {
+                    "meta_data": [
+                        {"key": "vendor_gallery_layout", "value": "slider"}
+                    ]
+                },
             }
         ],
         "raw_api": {
             "description": "<p>Solitaire engagement ring.</p>",
             "short_description": "<p>Made to order.</p>",
+            "meta_data": [
+                {"key": "seo_material", "value": "recycled gold"}
+            ],
         },
     }
     connection.execute(
@@ -160,6 +176,10 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
     assert rows[0]["Attribute 1 global"] == "1"
     assert rows[0]["meta:_diamond_carat"] == "1.96"
     assert rows[0]["meta:_diamond_growth_type"] == "HPHT"
+    assert rows[0]["meta:custom_badge"] == "Made to order"
+    assert rows[0]["meta:complex_config"] == '{"enabled":true}'
+    assert rows[0]["meta:seo_material"] == "recycled gold"
+    assert rows[0]["meta:custom_finish_note"] == ""
     assert rows[0]["meta:_s3_media_paths"] == "products/99/ring.jpg"
 
     assert rows[1]["Type"] == "variation"
@@ -170,15 +190,18 @@ def test_exports_parent_and_variation_rows_with_s3_images(tmp_path):
         "https://cdn.example.test/catalog/media/products/99/ring-white.jpg, "
         "https://cdn.example.test/catalog/media/products/99/ring-white-side.jpg"
     )
-    assert rows[1]["meta:_variation_gallery_urls"] == (
-        "https://cdn.example.test/catalog/media/products/99/ring-white-side.jpg"
+    assert rows[1]["meta:custom_finish_note"] == "Mirror"
+    assert rows[1]["meta:vendor_gallery_layout"] == "slider"
+    assert rows[1]["meta:custom_badge"] == ""
+    assert rows[1]["meta:_variation_gallery_source_urls"] == (
+        "https://source.test/ring-white-side.jpg"
     )
     assert rows[1]["meta:_s3_media_paths"] == (
         "products/99/ring-white.jpg | products/99/ring-white-side.jpg"
     )
 
 
-def test_uses_raw_product_categories_when_normalized_assignment_is_missing(tmp_path):
+def test_does_not_fallback_to_raw_categories_or_source_images(tmp_path):
     connection = sqlite3.connect(":memory:")
     connection.executescript(
         """
@@ -196,7 +219,13 @@ def test_uses_raw_product_categories_when_normalized_assignment_is_missing(tmp_p
         "categories": [{"id": "diamond", "name": "Lab Grown Diamonds"}],
         "attributes": [],
         "variations": [],
-        "media": [],
+        "media": [
+            {
+                "role": "featured",
+                "source_url": "https://source.test/diamond.jpg",
+                "local_path": "products/diamond-1/diamond.jpg",
+            }
+        ],
     }
     connection.execute(
         "INSERT INTO products VALUES (?, ?)",
@@ -209,4 +238,10 @@ def test_uses_raw_product_categories_when_normalized_assignment_is_missing(tmp_p
         encoding="utf-8-sig", newline=""
     ) as handle:
         row = next(csv.DictReader(handle))
-    assert row["Categories"] == "Lab Grown Diamonds"
+    assert row["Categories"] == ""
+    assert row["Images"] == ""
+    assert row["Published"] == ""
+    assert row["In stock?"] == ""
+    assert row["Regular price"] == ""
+    assert row["meta:_source_image_urls"] == "https://source.test/diamond.jpg"
+    assert row["meta:_s3_media_paths"] == "products/diamond-1/diamond.jpg"

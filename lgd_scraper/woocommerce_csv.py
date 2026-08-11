@@ -54,11 +54,6 @@ BASE_COLUMNS = [
     "External URL",
     "Button text",
     "Position",
-    "meta:_source_product_id",
-    "meta:_source_variation_id",
-    "meta:_source_url",
-    "meta:_variation_gallery_urls",
-    "meta:_s3_media_paths",
 ]
 
 
@@ -103,16 +98,27 @@ def _variation_sku(product: dict[str, Any], variation: dict[str, Any]) -> str:
     return f"{parent_sku}-V-{variation_id}"
 
 
-def _published(status: Any) -> int:
-    if status in (None, "", "publish", "published"):
+def _published(status: Any) -> int | str:
+    if status in ("publish", "published"):
         return 1
     if status == "private":
         return 0
-    return -1
+    if status:
+        return -1
+    return ""
 
 
-def _stock_flag(stock_status: Any) -> int:
-    return 0 if str(stock_status or "").lower() in {"outofstock", "out-of-stock"} else 1
+def _stock_flag(stock_status: Any) -> int | str:
+    normalized = str(stock_status or "").lower()
+    if normalized in {"outofstock", "out-of-stock"}:
+        return 0
+    if normalized in {"instock", "in-stock", "onbackorder", "on-backorder"}:
+        return 1
+    return ""
+
+
+def _bool_flag(value: Any) -> int | str:
+    return "" if value is None else int(bool(value))
 
 
 def _raw_api(product: dict[str, Any]) -> dict[str, Any]:
@@ -129,7 +135,7 @@ def _media_url(media: dict[str, Any], public_base_url: str | None) -> str:
     )
     if local_path and valid_public_base:
         return f"{public_base_url.rstrip('/')}/{local_path}"
-    return str(media.get("source_url") or "")
+    return ""
 
 
 def _product_image_urls(
@@ -187,9 +193,6 @@ def _variation_image_urls(
         url = _media_url(media, public_base_url)
         if url and url not in result:
             result.append(url)
-    fallback = str(variation.get("image_url") or "")
-    if not result and fallback:
-        result.append(fallback)
     for image in variation.get("gallery") or []:
         url = _media_url(image, public_base_url)
         if url and url not in result:
@@ -236,26 +239,8 @@ def _product_categories(
         (product_id,),
     ).fetchall()
     values: list[str] = []
-    for category_id, category_name in rows:
-        value = category_paths.get(str(category_id)) or category_name or ""
-        if value and value not in values:
-            values.append(value)
-    return ", ".join(values)
-
-
-def _raw_product_categories(
-    product: dict[str, Any], category_paths: dict[str, str]
-) -> str:
-    values: list[str] = []
-    for category in product.get("categories") or []:
-        if not isinstance(category, dict):
-            value = str(category or "").strip()
-        else:
-            category_id = str(category.get("id") or "")
-            value = (
-                category_paths.get(category_id)
-                or str(category.get("name") or category.get("slug") or "").strip()
-            )
+    for category_id, _category_name in rows:
+        value = category_paths.get(str(category_id), "")
         if value and value not in values:
             values.append(value)
     return ", ".join(values)
@@ -269,9 +254,115 @@ def _meta_value(value: Any) -> str:
     return str(value)
 
 
-def _diamond_details(product: dict[str, Any]) -> dict[str, Any]:
-    details = product.get("diamond_details")
-    return details if isinstance(details, dict) else {}
+def _metadata_entries(value: Any) -> list[tuple[str, Any]]:
+    """Return arbitrary metadata entries without maintaining a fixed key list."""
+
+    entries: list[tuple[str, Any]] = []
+    if isinstance(value, dict):
+        entries.extend(
+            (str(key).strip(), item)
+            for key, item in value.items()
+            if str(key).strip()
+        )
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key") or item.get("name")
+            if key not in (None, ""):
+                entries.append((str(key).strip(), item.get("value")))
+    return entries
+
+
+def _source_media_urls(
+    product: dict[str, Any], variation: dict[str, Any] | None = None
+) -> list[str]:
+    variation_id = str((variation or {}).get("id") or "")
+    result: list[str] = []
+    for media in product.get("media") or []:
+        role = media.get("role")
+        media_variation_id = str(media.get("variation_id") or "")
+        if variation is None and role in {"variation", "variation_gallery"}:
+            continue
+        if variation is not None and media_variation_id != variation_id:
+            continue
+        url = str(media.get("source_url") or "")
+        if url and url not in result:
+            result.append(url)
+    if variation is not None:
+        for value in [variation.get("image_url"), *(variation.get("gallery") or [])]:
+            url = (
+                str(value.get("source_url") or value.get("src") or "")
+                if isinstance(value, dict)
+                else str(value or "")
+            )
+            if url and url not in result:
+                result.append(url)
+    return result
+
+
+def _row_metadata(
+    product: dict[str, Any], variation: dict[str, Any] | None = None
+) -> OrderedDict[str, Any]:
+    """Collect source and scraper metadata into dynamic WooCommerce columns."""
+
+    metadata: OrderedDict[str, Any] = OrderedDict()
+
+    containers: list[dict[str, Any]] = [product, _raw_api(product)]
+    if variation is not None:
+        containers = [variation]
+        raw_variation = variation.get("raw")
+        if isinstance(raw_variation, dict):
+            containers.append(raw_variation)
+
+    for container in containers:
+        for field in ("meta_data", "metadata", "meta"):
+            for key, value in _metadata_entries(container.get(field)):
+                metadata[key.removeprefix("meta:")] = value
+
+    if variation is None:
+        details = product.get("diamond_details")
+        if isinstance(details, dict):
+            for key, value in details.items():
+                normalized = _slug(key).replace("-", "_")
+                if normalized:
+                    metadata[f"_diamond_{normalized}"] = value
+
+    system_metadata: OrderedDict[str, Any] = OrderedDict(
+        [
+            ("_source_product_id", product.get("id")),
+            (
+                "_source_variation_id",
+                variation.get("id") if variation is not None else None,
+            ),
+            ("_source_url", product.get("url")),
+            (
+                "_source_image_urls",
+                " | ".join(_source_media_urls(product, variation)),
+            ),
+            (
+                "_s3_media_paths",
+                " | ".join(
+                    _media_paths(
+                        product,
+                        str(variation.get("id") or "")
+                        if variation is not None
+                        else None,
+                    )
+                ),
+            ),
+        ]
+    )
+    if variation is not None:
+        source_urls = _source_media_urls(product, variation)
+        system_metadata["_variation_gallery_source_urls"] = " | ".join(
+            source_urls[1:]
+        )
+
+    for key, value in system_metadata.items():
+        if value not in (None, "", [], {}):
+            metadata.setdefault(key, value)
+    return metadata
 
 
 def _attribute_defs(product: dict[str, Any]) -> list[dict[str, Any]]:
@@ -370,11 +461,10 @@ def _base_product_row(
     dimensions = api.get("dimensions") or {}
     images = _product_image_urls(product, public_base_url)
     variations = product.get("variations") or []
-    product_type = "variable" if variations else str(product.get("type") or "simple")
-
     categories = _product_categories(connection, product_id, category_paths)
-    if not categories:
-        categories = _raw_product_categories(product, category_paths)
+
+    product_type = "variable" if variations else product.get("type") or ""
+    backorders = api.get("backorders")
 
     return {
         "ID": "",
@@ -382,24 +472,26 @@ def _base_product_row(
         "SKU": _product_sku(product),
         "Name": product.get("name") or "",
         "Published": _published(product.get("status")),
-        "Is featured?": int(bool(api.get("featured"))),
-        "Visibility in catalog": product.get("catalog_visibility") or "visible",
-        "Short description": api.get("short_description") or product.get("short_description_html") or product.get("short_description") or "",
-        "Description": api.get("description") or product.get("description_html") or product.get("description") or "",
-        "Tax status": api.get("tax_status") or "taxable",
+        "Is featured?": _bool_flag(api.get("featured")),
+        "Visibility in catalog": product.get("catalog_visibility") or "",
+        "Short description": product.get("short_description") or "",
+        "Description": product.get("description") or "",
+        "Tax status": api.get("tax_status") or "",
         "Tax class": api.get("tax_class") or "",
         "In stock?": _stock_flag(product.get("stock_status")),
         "Stock": product.get("stock_quantity") if product.get("stock_quantity") is not None else "",
-        "Backorders allowed?": int(str(api.get("backorders") or "no") != "no"),
-        "Sold individually?": int(bool(api.get("sold_individually"))),
+        "Backorders allowed?": (
+            "" if backorders is None else int(str(backorders) != "no")
+        ),
+        "Sold individually?": _bool_flag(api.get("sold_individually")),
         "Weight (kg)": api.get("weight") or "",
         "Length (cm)": dimensions.get("length") or "",
         "Width (cm)": dimensions.get("width") or "",
         "Height (cm)": dimensions.get("height") or "",
-        "Allow customer reviews?": int(api.get("reviews_allowed", True)),
+        "Allow customer reviews?": _bool_flag(api.get("reviews_allowed")),
         "Purchase note": api.get("purchase_note") or "",
         "Sale price": product.get("sale_price") or "",
-        "Regular price": product.get("regular_price") or product.get("price") or "",
+        "Regular price": product.get("regular_price") or "",
         "Categories": categories,
         "Tags": ", ".join(tag_names),
         "Shipping class": api.get("shipping_class") or "",
@@ -412,12 +504,7 @@ def _base_product_row(
         "Cross-sells": "",
         "External URL": api.get("external_url") or "",
         "Button text": api.get("button_text") or "",
-        "Position": api.get("menu_order") or 0,
-        "meta:_source_product_id": product_id,
-        "meta:_source_variation_id": "",
-        "meta:_source_url": product.get("url") or "",
-        "meta:_variation_gallery_urls": "",
-        "meta:_s3_media_paths": " | ".join(_media_paths(product)),
+        "Position": api.get("menu_order") if api.get("menu_order") is not None else "",
     }
 
 
@@ -428,19 +515,16 @@ def _variation_row(
     public_base_url: str | None,
 ) -> dict[str, Any]:
     dimensions = variation.get("dimensions") or {}
-    row = {
-        column: "" for column in BASE_COLUMNS
-    }
-    variation_id = str(variation.get("id") or "")
+    row = {column: "" for column in BASE_COLUMNS}
     variation_images = _variation_image_urls(product, variation, public_base_url)
     row.update(
         {
             "Type": "variation",
             "SKU": _variation_sku(product, variation),
-            "Name": variation.get("name") or product.get("name") or "",
-            "Published": 1 if variation.get("visible", True) is not False else 0,
-            "Visibility in catalog": "visible",
-            "Tax status": "taxable",
+            "Name": variation.get("name") or "",
+            "Published": _bool_flag(variation.get("visible")),
+            "Visibility in catalog": variation.get("catalog_visibility") or "",
+            "Tax status": variation.get("tax_status") or "",
             "In stock?": _stock_flag(variation.get("stock_status")),
             "Stock": variation.get("stock_quantity")
             if variation.get("stock_quantity") is not None
@@ -450,18 +534,9 @@ def _variation_row(
             "Width (cm)": dimensions.get("width") or "",
             "Height (cm)": dimensions.get("height") or "",
             "Sale price": variation.get("sale_price") or "",
-            "Regular price": variation.get("regular_price")
-            or variation.get("price")
-            or "",
+            "Regular price": variation.get("regular_price") or "",
             "Images": ", ".join(variation_images),
             "Parent": _product_sku(product),
-            "meta:_source_product_id": product.get("id") or "",
-            "meta:_source_variation_id": variation.get("id") or "",
-            "meta:_source_url": product.get("url") or "",
-            "meta:_variation_gallery_urls": " | ".join(variation_images[1:]),
-            "meta:_s3_media_paths": " | ".join(
-                _media_paths(product, variation_id)
-            ),
         }
     )
     for index, definition in enumerate(definitions, 1):
@@ -483,22 +558,23 @@ def export_woocommerce_csvs(
     """Create one WooCommerce core-importer master CSV.
 
     The file contains simple products, variable parents, and variation rows in
-    parent-first order.  Arbitrary diamond details are retained as importable
-    ``meta:_diamond_*`` columns.
+    parent-first order. Every discovered product and variation metadata key is
+    retained as a dynamic ``meta:*`` column.
     """
 
     category_paths = _category_paths(connection)
     maximum_attributes = 0
-    diamond_detail_keys: OrderedDict[str, str] = OrderedDict()
+    metadata_keys: OrderedDict[str, None] = OrderedDict()
     for (raw_json,) in connection.execute(
         "SELECT raw_json FROM products ORDER BY id"
     ):
         product = json.loads(raw_json)
         maximum_attributes = max(maximum_attributes, len(_attribute_defs(product)))
-        for name in _diamond_details(product):
-            key = _slug(name).replace("-", "_")
-            if key and key not in diamond_detail_keys:
-                diamond_detail_keys[key] = str(name)
+        for key in _row_metadata(product):
+            metadata_keys.setdefault(key, None)
+        for variation in product.get("variations") or []:
+            for key in _row_metadata(product, variation):
+                metadata_keys.setdefault(key, None)
     attribute_columns: list[str] = []
     for index in range(1, maximum_attributes + 1):
         attribute_columns.extend(
@@ -510,10 +586,8 @@ def export_woocommerce_csvs(
                 f"Attribute {index} global",
             ]
         )
-    diamond_columns = [
-        f"meta:_diamond_{key}" for key in diamond_detail_keys
-    ]
-    columns = BASE_COLUMNS + attribute_columns + diamond_columns
+    metadata_columns = [f"meta:{key}" for key in metadata_keys]
+    columns = BASE_COLUMNS + attribute_columns + metadata_columns
 
     parent_count = 0
     variation_count = 0
@@ -545,15 +619,8 @@ def export_woocommerce_csvs(
                     parent[f"Attribute {index} default"] = definition["default"]
                     parent[f"Attribute {index} visible"] = definition["visible"]
                     parent[f"Attribute {index} global"] = definition["global"]
-                details = _diamond_details(product)
-                normalized_details = {
-                    _slug(key).replace("-", "_"): value
-                    for key, value in details.items()
-                }
-                for key in diamond_detail_keys:
-                    parent[f"meta:_diamond_{key}"] = _meta_value(
-                        normalized_details.get(key)
-                    )
+                for key, value in _row_metadata(product).items():
+                    parent[f"meta:{key}"] = _meta_value(value)
                 writer.writerow(parent)
                 parent_count += 1
 
@@ -561,6 +628,8 @@ def export_woocommerce_csvs(
                     variation_row = _variation_row(
                         product, variation, definitions, public_base_url
                     )
+                    for key, value in _row_metadata(product, variation).items():
+                        variation_row[f"meta:{key}"] = _meta_value(value)
                     writer.writerow(variation_row)
                     variation_count += 1
         temporary.replace(target)

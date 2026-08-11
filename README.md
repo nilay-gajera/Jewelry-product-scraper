@@ -215,7 +215,13 @@ and their variation rows in parent-first order.
 Parent and variation SKUs are generated when the source lacks one. Category
 hierarchies use `Parent > Child`, variation rows reference the parent SKU, the
 first parent image is featured, and each variation receives its assigned image.
-Always test a small import on a staging store before importing the full catalog.
+The exporter does not fill missing catalog fields with guessed defaults. Category
+values come only from normalized assignments, and the `Images` column contains
+only durable URLs derived from `S3_PUBLIC_BASE_URL`; it never falls back to the
+original site. Every metadata key discovered on a product or variation becomes
+a dynamic `meta:<key>` column, including newly encountered keys and structured
+values. Always test a small import on a staging store before importing the full
+catalog.
 
 ### S3 object layout
 
