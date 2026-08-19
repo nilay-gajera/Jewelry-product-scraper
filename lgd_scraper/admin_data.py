@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from lgd_scraper.mysql_backend import mysql_connect, mysql_enabled
 from lgd_scraper.s3sync import (
     load_json_object,
     presigned_media_url,
     save_json_object,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -125,6 +129,41 @@ def _connect(database_path: Path) -> sqlite3.Connection | None:
     return connection
 
 
+def _connect_mysql():
+    """Return a MySQL connection or None if MySQL is not configured/reachable."""
+    if not mysql_enabled():
+        return None
+    try:
+        return mysql_connect(autocommit=True)
+    except Exception as exc:
+        _LOGGER.debug("MySQL unavailable, falling back to SQLite: %s", exc)
+        return None
+
+
+def _mysql_table_exists(connection, table: str) -> bool:
+    cursor = connection.cursor()
+    cursor.execute("SHOW TABLES LIKE %s", (table,))
+    result = cursor.fetchone() is not None
+    cursor.close()
+    return result
+
+
+def _mysql_fetchone(connection, sql: str, params=()) -> tuple | None:
+    cursor = connection.cursor()
+    cursor.execute(sql, params)
+    row = cursor.fetchone()
+    cursor.close()
+    return row
+
+
+def _mysql_fetchall(connection, sql: str, params=()) -> list[tuple]:
+    cursor = connection.cursor()
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
 def _json(value: str | None, fallback: Any) -> Any:
     if not value:
         return fallback
@@ -187,9 +226,8 @@ def quality_for(product: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def catalog_summary(database_path: Path) -> dict[str, Any]:
-    connection = _connect(database_path)
-    empty = {
+def _empty_summary() -> dict[str, Any]:
+    return {
         "products": 0,
         "variations": 0,
         "images": 0,
@@ -217,6 +255,98 @@ def catalog_summary(database_path: Path) -> dict[str, Any]:
             "products_with_media_failures": 0,
         },
     }
+
+
+def catalog_summary(database_path: Path) -> dict[str, Any]:
+    mysql_conn = _connect_mysql()
+    if mysql_conn is not None:
+        try:
+            return _catalog_summary_mysql(mysql_conn)
+        except Exception as exc:
+            _LOGGER.warning("MySQL catalog_summary failed, falling back: %s", exc)
+        finally:
+            mysql_conn.close()
+    return _catalog_summary_sqlite(database_path)
+
+
+def _catalog_summary_mysql(connection) -> dict[str, Any]:
+    empty = _empty_summary()
+    tables_to_count = ["products", "variations", "images", "categories", "attributes", "diagnostics"]
+    for table in tables_to_count:
+        if _mysql_table_exists(connection, table):
+            row = _mysql_fetchone(connection, f"SELECT COUNT(*) FROM {table}")
+            empty[table] = row[0] if row else 0
+
+    if _mysql_table_exists(connection, "products"):
+        row = _mysql_fetchone(
+            connection,
+            """
+            SELECT
+                COALESCE(SUM(product_family = 'loose_diamond' OR product_type = 'variable'), 0),
+                COALESCE(SUM((product_family = 'loose_diamond' OR product_type = 'variable')
+                             AND enrichment_schema_version >= 1), 0),
+                COALESCE(SUM(product_family = 'loose_diamond'), 0),
+                COALESCE(SUM(product_family = 'loose_diamond' AND enrichment_schema_version >= 1), 0),
+                COALESCE(SUM(product_type = 'variable'), 0),
+                COALESCE(SUM(product_type = 'variable' AND enrichment_schema_version >= 1), 0)
+            FROM products
+            """
+        )
+        if row:
+            enrichment = empty["enrichment"]
+            (
+                enrichment["candidates"],
+                enrichment["completed"],
+                enrichment["diamonds"],
+                enrichment["diamonds_completed"],
+                enrichment["variable_products"],
+                enrichment["variable_products_completed"],
+            ) = tuple(row)
+            enrichment["remaining"] = max(
+                0, enrichment["candidates"] - enrichment["completed"]
+            )
+
+    if _mysql_table_exists(connection, "variations"):
+        row = _mysql_fetchone(
+            connection,
+            "SELECT COUNT(*) FROM variations WHERE JSON_VALID(raw_json) AND COALESCE(JSON_LENGTH(JSON_EXTRACT(raw_json, '$.gallery')), 0) > 0"
+        )
+        if row:
+            empty["enrichment"]["variations_with_gallery"] = row[0]
+
+    if _mysql_table_exists(connection, "images"):
+        row = _mysql_fetchone(
+            connection,
+            """
+            SELECT
+                COALESCE(SUM(role = 'variation_gallery'), 0),
+                COALESCE(SUM(local_path IS NULL OR TRIM(local_path) = ''), 0)
+            FROM images
+            """
+        )
+        if row:
+            empty["enrichment"]["variation_gallery_images"] = row[0]
+            empty["enrichment"]["media_missing_storage"] = row[1]
+
+    quality_checks = {
+        "missing_images": "SELECT COUNT(*) FROM products p WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id)",
+        "missing_categories": "SELECT COUNT(*) FROM products p WHERE NOT EXISTS (SELECT 1 FROM product_categories pc WHERE pc.product_id = p.id)",
+        "missing_attributes": "SELECT COUNT(*) FROM products p WHERE NOT EXISTS (SELECT 1 FROM product_attributes pa WHERE pa.product_id = p.id)",
+        "missing_variations": "SELECT COUNT(*) FROM products p WHERE p.product_type = 'variable' AND NOT EXISTS (SELECT 1 FROM variations v WHERE v.product_id = p.id)",
+    }
+    for key, query in quality_checks.items():
+        try:
+            row = _mysql_fetchone(connection, query)
+            empty["quality"][key] = row[0] if row else 0
+        except Exception:
+            pass
+
+    return empty
+
+
+def _catalog_summary_sqlite(database_path: Path) -> dict[str, Any]:
+    connection = _connect(database_path)
+    empty = _empty_summary()
     if connection is None:
         return empty
     try:
@@ -383,6 +513,142 @@ def list_products(
     page: int = 1,
     page_size: int = 25,
 ) -> dict[str, Any]:
+    mysql_conn = _connect_mysql()
+    if mysql_conn is not None:
+        try:
+            return _list_products_mysql(
+                mysql_conn, query=query, product_type=product_type,
+                category_id=category_id, stock_status=stock_status,
+                coverage=coverage, sort=sort, page=page, page_size=page_size,
+            )
+        except Exception as exc:
+            _LOGGER.warning("MySQL list_products failed, falling back: %s", exc)
+        finally:
+            mysql_conn.close()
+    return _list_products_sqlite(
+        database_path, query=query, product_type=product_type,
+        category_id=category_id, stock_status=stock_status,
+        coverage=coverage, sort=sort, page=page, page_size=page_size,
+    )
+
+
+def _build_product_item(row_dict: dict[str, Any]) -> dict[str, Any]:
+    """Build a product list item from a row with raw_json."""
+    product = _json(row_dict.get("raw_json"), {})
+    media = product.get("media") or []
+    unique_media_count = len(
+        {item.get("source_url") for item in media if item.get("source_url")}
+    )
+    featured = next(
+        (item for item in media if item.get("role") == "featured"),
+        media[0] if media else None,
+    )
+    return {
+        "id": row_dict.get("id"),
+        "name": row_dict.get("name"),
+        "sku": row_dict.get("sku"),
+        "type": row_dict.get("product_type"),
+        "price": row_dict.get("price"),
+        "currency": product.get("currency") or "",
+        "stock_status": row_dict.get("stock_status"),
+        "source": row_dict.get("source"),
+        "thumbnail": public_media_url(featured) if featured else "",
+        "variation_count": len(product.get("variations") or []),
+        "image_count": unique_media_count,
+        "category_count": len(product.get("categories") or []),
+        "categories": [
+            item.get("name") for item in product.get("categories") or []
+        ],
+        "updated": product.get("date_modified"),
+        "quality": quality_for(product),
+    }
+
+
+def _list_products_mysql(
+    connection,
+    *,
+    query: str,
+    product_type: str,
+    category_id: str,
+    stock_status: str,
+    coverage: str,
+    sort: str,
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
+    where: list[str] = []
+    parameters: list[Any] = []
+    if query:
+        where.append("(p.name LIKE %s OR p.sku LIKE %s OR p.id LIKE %s)")
+        pattern = f"%{query}%"
+        parameters.extend([pattern, pattern, pattern])
+    if product_type:
+        where.append("p.product_type = %s")
+        parameters.append(product_type)
+    if category_id:
+        where.append(
+            "EXISTS (SELECT 1 FROM product_categories pc "
+            "WHERE pc.product_id = p.id AND pc.category_id = %s)"
+        )
+        parameters.append(category_id)
+    if stock_status:
+        where.append("p.stock_status = %s")
+        parameters.append(stock_status)
+    coverage_filters = {
+        "complete": "EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id) AND EXISTS (SELECT 1 FROM product_categories pc WHERE pc.product_id = p.id) AND EXISTS (SELECT 1 FROM product_attributes pa WHERE pa.product_id = p.id) AND (p.product_type != 'variable' OR EXISTS (SELECT 1 FROM variations v WHERE v.product_id = p.id))",
+        "missing_images": "NOT EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id)",
+        "missing_categories": "NOT EXISTS (SELECT 1 FROM product_categories pc WHERE pc.product_id = p.id)",
+        "missing_attributes": "NOT EXISTS (SELECT 1 FROM product_attributes pa WHERE pa.product_id = p.id)",
+        "missing_variations": "p.product_type = 'variable' AND NOT EXISTS (SELECT 1 FROM variations v WHERE v.product_id = p.id)",
+    }
+    if coverage in coverage_filters:
+        where.append(f"({coverage_filters[coverage]})")
+
+    name_asc = "COALESCE(NULLIF(p.name, ''), p.id) ASC, p.id ASC"
+    name_desc = "COALESCE(NULLIF(p.name, ''), p.id) DESC, p.id DESC"
+    sort_orders = {
+        "name_asc": name_asc,
+        "name_desc": name_desc,
+        "price_asc": f"CASE WHEN NULLIF(p.price, '') IS NULL THEN 1 ELSE 0 END, CAST(p.price AS DECIMAL(20,2)) ASC, {name_asc}",
+        "price_desc": f"CASE WHEN NULLIF(p.price, '') IS NULL THEN 1 ELSE 0 END, CAST(p.price AS DECIMAL(20,2)) DESC, {name_asc}",
+        "quality_desc": name_asc,
+        "quality_asc": name_asc,
+        "images_desc": name_asc,
+        "images_asc": name_asc,
+        "variations_desc": name_asc,
+        "variations_asc": name_asc,
+    }
+    order_by = sort_orders.get(sort, name_asc)
+    clause = f" WHERE {' AND '.join(where)}" if where else ""
+
+    import pymysql.cursors
+    cursor = connection.cursor(pymysql.cursors.DictCursor)
+    cursor.execute(f"SELECT COUNT(*) AS cnt FROM products p{clause}", parameters)
+    total = cursor.fetchone()["cnt"]
+    cursor.execute(
+        f"SELECT p.id, p.name, p.sku, p.product_type, p.price, "
+        f"p.stock_status, p.source, p.raw_json "
+        f"FROM products p{clause} ORDER BY {order_by} LIMIT %s OFFSET %s",
+        [*parameters, page_size, (page - 1) * page_size],
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    items = [_build_product_item(row) for row in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+def _list_products_sqlite(
+    database_path: Path,
+    *,
+    query: str,
+    product_type: str,
+    category_id: str,
+    stock_status: str,
+    coverage: str,
+    sort: str,
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
     connection = _connect(database_path)
     if connection is None:
         return {"items": [], "total": 0, "page": page, "page_size": page_size}
@@ -464,42 +730,7 @@ def list_products(
             """,
             [*parameters, page_size, (page - 1) * page_size],
         ).fetchall()
-        items: list[dict[str, Any]] = []
-        for row in rows:
-            product = _json(row["raw_json"], {})
-            media = product.get("media") or []
-            unique_media_count = len(
-                {
-                    item.get("source_url")
-                    for item in media
-                    if item.get("source_url")
-                }
-            )
-            featured = next(
-                (item for item in media if item.get("role") == "featured"),
-                media[0] if media else None,
-            )
-            items.append(
-                {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "sku": row["sku"],
-                    "type": row["product_type"],
-                    "price": row["price"],
-                    "currency": product.get("currency") or "",
-                    "stock_status": row["stock_status"],
-                    "source": row["source"],
-                    "thumbnail": public_media_url(featured) if featured else "",
-                    "variation_count": len(product.get("variations") or []),
-                    "image_count": unique_media_count,
-                    "category_count": len(product.get("categories") or []),
-                    "categories": [
-                        item.get("name") for item in product.get("categories") or []
-                    ],
-                    "updated": product.get("date_modified"),
-                    "quality": quality_for(product),
-                }
-            )
+        items = [_build_product_item(dict(row)) for row in rows]
         return {"items": items, "total": total, "page": page, "page_size": page_size}
     finally:
         connection.close()
@@ -508,6 +739,45 @@ def list_products(
 def product_filter_options(database_path: Path) -> dict[str, Any]:
     """Return compact filter facets for the product administration page."""
 
+    mysql_conn = _connect_mysql()
+    if mysql_conn is not None:
+        try:
+            return _product_filter_options_mysql(mysql_conn)
+        except Exception as exc:
+            _LOGGER.warning("MySQL product_filter_options failed: %s", exc)
+        finally:
+            mysql_conn.close()
+    return _product_filter_options_sqlite(database_path)
+
+
+def _product_filter_options_mysql(connection) -> dict[str, Any]:
+    import pymysql.cursors
+    cursor = connection.cursor(pymysql.cursors.DictCursor)
+    cursor.execute(
+        "SELECT product_type AS value, COUNT(*) AS count FROM products "
+        "WHERE COALESCE(product_type, '') != '' GROUP BY product_type ORDER BY product_type"
+    )
+    types = list(cursor.fetchall())
+    cursor.execute(
+        "SELECT stock_status AS value, COUNT(*) AS count FROM products "
+        "WHERE COALESCE(stock_status, '') != '' GROUP BY stock_status ORDER BY stock_status"
+    )
+    stock_statuses = list(cursor.fetchall())
+    categories = []
+    if _mysql_table_exists(connection, "product_categories"):
+        cursor.execute(
+            "SELECT pc.category_id AS id, "
+            "COALESCE(MAX(NULLIF(pc.category_name, '')), pc.category_id) AS name, "
+            "COUNT(DISTINCT pc.product_id) AS count "
+            "FROM product_categories pc JOIN products p ON p.id = pc.product_id "
+            "GROUP BY pc.category_id ORDER BY name"
+        )
+        categories = list(cursor.fetchall())
+    cursor.close()
+    return {"categories": categories, "types": types, "stock_statuses": stock_statuses}
+
+
+def _product_filter_options_sqlite(database_path: Path) -> dict[str, Any]:
     empty = {"categories": [], "types": [], "stock_statuses": []}
     connection = _connect(database_path)
     if connection is None:
@@ -558,6 +828,25 @@ def product_filter_options(database_path: Path) -> dict[str, Any]:
 
 
 def product_detail(database_path: Path, product_id: str) -> dict[str, Any] | None:
+    mysql_conn = _connect_mysql()
+    if mysql_conn is not None:
+        try:
+            row = _mysql_fetchone(
+                mysql_conn,
+                "SELECT raw_json FROM products WHERE id = %s",
+                (product_id,),
+            )
+            if not row:
+                return None
+            product = _json(row[0], {})
+            for media in product.get("media") or []:
+                media["display_url"] = public_media_url(media)
+            product["quality"] = quality_for(product)
+            return product
+        except Exception as exc:
+            _LOGGER.warning("MySQL product_detail failed: %s", exc)
+        finally:
+            mysql_conn.close()
     connection = _connect(database_path)
     if connection is None:
         return None
@@ -577,6 +866,30 @@ def product_detail(database_path: Path, product_id: str) -> dict[str, Any] | Non
 
 
 def diagnostics(database_path: Path, limit: int = 100) -> list[dict[str, Any]]:
+    mysql_conn = _connect_mysql()
+    if mysql_conn is not None:
+        try:
+            rows = _mysql_fetchall(
+                mysql_conn,
+                "SELECT created_at, kind, url, status, message, raw_json "
+                "FROM diagnostics ORDER BY id DESC LIMIT %s",
+                (limit,),
+            )
+            return [
+                {
+                    "created_at": row[0],
+                    "kind": row[1],
+                    "url": row[2],
+                    "status": row[3],
+                    "message": row[4],
+                    "details": _json(row[5], {}),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            _LOGGER.warning("MySQL diagnostics failed: %s", exc)
+        finally:
+            mysql_conn.close()
     connection = _connect(database_path)
     if connection is None:
         return []

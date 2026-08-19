@@ -39,6 +39,7 @@ from lgd_scraper.catalog_mutations import (
     unreferenced_media_paths,
 )
 from lgd_scraper.discovery import CatalogDiscoveryError, discover_catalog
+from lgd_scraper.mysql_backend import mysql_enabled, sync_from_sqlite
 from lgd_scraper.s3sync import (
     delete_media_objects,
     download_checkpoint,
@@ -415,6 +416,16 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
         _persist_run(state)
         if process is current_process:
             process = None
+
+    # Sync catalog to MySQL (non-blocking, best-effort)
+    if successful and mysql_enabled():
+        try:
+            sync_from_sqlite(DATABASE_PATH)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Post-crawl MySQL sync failed: %s", exc
+            )
 
 
 @app.get("/health")
