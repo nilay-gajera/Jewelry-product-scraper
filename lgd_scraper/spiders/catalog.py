@@ -230,7 +230,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             )
 
     def _start_enrichment_requests(self):
-        """Refresh saved diamonds and variable products without recrawling the catalog."""
+        """Refresh saved products without recrawling the catalog.
+
+        Uses SQL-level filtering and LIMIT/OFFSET batching to keep memory
+        usage bounded even for 40K+ product catalogs.
+        """
 
         database_path = Path(self.output_dir).resolve() / "catalog.sqlite"
         self.logger.info(
@@ -262,43 +266,64 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 self.logger.info(
                     "Enrichment: catalog contains %d products", total_count
                 )
-                cursor = connection.execute(
-                    "SELECT raw_json FROM products ORDER BY id"
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(products)"
+                    ).fetchall()
+                }
+                has_url_col = "url" in columns
+
+                # Filter at SQL level if column exists: only load products that have a URL.
+                skipped_no_url = (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM products WHERE url IS NULL OR url = ''"
+                    ).fetchone()[0]
+                    if has_url_col
+                    else 0
                 )
-                skipped_no_url = 0
-                skipped_family = 0
-                for (raw_json,) in cursor:
+
+                batch_size = 500
+                offset = 0
+                while True:
                     if self.max_products and self.products_scheduled >= self.max_products:
                         break
-                    try:
-                        product = json.loads(raw_json)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    if not isinstance(product, dict) or not product.get("url"):
-                        skipped_no_url += 1
-                        continue
-                    if not (
-                        product.get("product_family") == "loose_diamond"
-                        or product.get("type") == "variable"
-                        or product.get("variations")
-                    ):
-                        skipped_family += 1
-                        continue
-                    if not self._needs_enrichment(product):
-                        self.products_already_enriched += 1
-                        continue
-                    product["_record_type"] = "product"
-                    self.products_scheduled += 1
-                    yield self._page_request(
-                        str(product["url"]), product, dont_filter=True
+                    query = (
+                        "SELECT raw_json FROM products "
+                        "WHERE url IS NOT NULL AND url != '' "
+                        "ORDER BY id LIMIT ? OFFSET ?"
+                        if has_url_col
+                        else "SELECT raw_json FROM products ORDER BY id LIMIT ? OFFSET ?"
                     )
+                    rows = connection.execute(query, (batch_size, offset)).fetchall()
+                    if not rows:
+                        break
+                    offset += len(rows)
+                    for (raw_json,) in rows:
+                        if self.max_products and self.products_scheduled >= self.max_products:
+                            break
+                        try:
+                            product = json.loads(raw_json)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        if not isinstance(product, dict) or not product.get("url"):
+                            if not has_url_col:
+                                skipped_no_url += 1
+                            continue
+                        if not self._needs_enrichment(product):
+                            self.products_already_enriched += 1
+                            continue
+                        product["_record_type"] = "product"
+                        self.products_scheduled += 1
+                        yield self._page_request(
+                            str(product["url"]), product, dont_filter=True
+                        )
                 self.logger.info(
                     "Enrichment: scheduled=%d, already_enriched=%d, "
-                    "skipped_no_url=%d, skipped_family=%d",
+                    "skipped_no_url=%d",
                     self.products_scheduled,
                     self.products_already_enriched,
                     skipped_no_url,
-                    skipped_family,
                 )
             finally:
                 connection.close()
@@ -2087,6 +2112,12 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         ):
             return
         self.products_emitted += 1
+        # Strip bulky raw payloads that duplicate normalized data. These are
+        # only useful during spider processing and roughly double the SQLite
+        # checkpoint size if persisted.
+        product.pop("raw_api", None)
+        for variation in product.get("variations") or []:
+            variation.pop("raw", None)
         yield product
 
     @staticmethod

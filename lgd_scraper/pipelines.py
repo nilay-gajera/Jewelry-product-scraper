@@ -134,6 +134,9 @@ class CatalogMediaPipeline(FilesPipeline):
 class CatalogWriterPipeline:
     """Write nested JSONL, normalized SQLite, flat CSVs, and a crawl summary."""
 
+    COMMIT_BATCH_SIZE = 50
+    PROGRESS_INTERVAL = 100
+
     def __init__(self):
         self.output_dir = Path("outputs/catalog")
         self.connection: sqlite3.Connection | None = None
@@ -143,6 +146,7 @@ class CatalogWriterPipeline:
         self.crawler = None
         self.woocommerce_counts: dict[str, int] = {}
         self.progress_path = Path("outputs/catalog/progress.json")
+        self._uncommitted = 0
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -150,8 +154,8 @@ class CatalogWriterPipeline:
         instance.crawler = crawler
         return instance
 
-    def open_spider(self):
-        spider = self.crawler.spider
+    def open_spider(self, spider=None):
+        spider = spider or (self.crawler.spider if self.crawler else None)
         self.output_dir = Path(getattr(spider, "output_dir", "outputs/catalog")).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.progress_path = self.output_dir / "progress.json"
@@ -260,7 +264,7 @@ class CatalogWriterPipeline:
         self.connection.execute("DELETE FROM diagnostics")
         self.connection.commit()
 
-    def process_item(self, item):
+    def process_item(self, item, spider=None):
         record_type = item.get("_record_type", "product")
         if record_type == "diagnostic":
             key = (
@@ -316,18 +320,28 @@ class CatalogWriterPipeline:
             self._store_diagnostic(item)
 
         assert self.connection is not None
-        self.connection.commit()
-        self._write_progress(item)
+        self._uncommitted += 1
+        if self._uncommitted >= self.COMMIT_BATCH_SIZE:
+            self.connection.commit()
+            self._uncommitted = 0
+        total = sum(self.counts.values())
+        if total % self.PROGRESS_INTERVAL == 0:
+            self._write_progress(item, spider=spider)
         return item
 
-    def _write_progress(self, item: dict[str, Any] | None = None) -> None:
+    def _write_progress(
+        self, item: dict[str, Any] | None = None, spider: Any = None
+    ) -> None:
+        resolved_spider = spider or (self.crawler.spider if self.crawler else None)
         payload = {
             "run_id": os.getenv("SCRAPER_RUN_ID"),
             "state": "running",
             "records_seen": dict(self.counts),
-            "products_scheduled": getattr(self.crawler.spider, "products_scheduled", 0),
+            "products_scheduled": getattr(
+                resolved_spider, "products_scheduled", 0
+            ),
             "products_already_enriched": getattr(
-                self.crawler.spider, "products_already_enriched", 0
+                resolved_spider, "products_already_enriched", 0
             ),
             "current_product": (
                 {
@@ -588,8 +602,8 @@ class CatalogWriterPipeline:
             ),
         )
 
-    def close_spider(self):
-        spider = self.crawler.spider
+    def close_spider(self, spider=None):
+        spider = spider or (self.crawler.spider if self.crawler else None)
         assert self.connection is not None
         self.connection.commit()
         for handle in self.handles.values():

@@ -351,13 +351,13 @@ class S3ArtifactPipeline:
         instance.crawler = crawler
         return instance
 
-    def open_spider(self):
+    def open_spider(self, spider):
         spider = self.crawler.spider
         self.output_dir = Path(
             getattr(spider, "output_dir", "outputs/catalog")
         ).resolve()
 
-    def process_item(self, item):
+    def process_item(self, item, spider):
         if not self.bucket or item.get("_record_type") != "product":
             return item
         self.products_seen += 1

@@ -48,6 +48,28 @@ def mysql_connect(*, autocommit: bool = False):
     )
 
 
+# Module-level cached connection for read-only admin dashboard queries.
+# Avoids creating a new TCP connection (~50ms to Hostinger) per API call.
+_read_connection = None
+
+
+def mysql_read_connect():
+    """Return a cached read-only connection, reconnecting if stale."""
+    global _read_connection
+    if _read_connection is not None:
+        try:
+            _read_connection.ping(reconnect=True)
+            return _read_connection
+        except Exception:
+            try:
+                _read_connection.close()
+            except Exception:
+                pass
+            _read_connection = None
+    _read_connection = mysql_connect(autocommit=True)
+    return _read_connection
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------

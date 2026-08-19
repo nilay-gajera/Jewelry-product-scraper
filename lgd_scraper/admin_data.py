@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from lgd_scraper.mysql_backend import mysql_connect, mysql_enabled
+from lgd_scraper.mysql_backend import mysql_read_connect, mysql_enabled
 from lgd_scraper.s3sync import (
     load_json_object,
     presigned_media_url,
@@ -134,7 +134,7 @@ def _connect_mysql():
     if not mysql_enabled():
         return None
     try:
-        return mysql_connect(autocommit=True)
+        return mysql_read_connect()
     except Exception as exc:
         _LOGGER.debug("MySQL unavailable, falling back to SQLite: %s", exc)
         return None
@@ -264,8 +264,6 @@ def catalog_summary(database_path: Path) -> dict[str, Any]:
             return _catalog_summary_mysql(mysql_conn)
         except Exception as exc:
             _LOGGER.warning("MySQL catalog_summary failed, falling back: %s", exc)
-        finally:
-            mysql_conn.close()
     return _catalog_summary_sqlite(database_path)
 
 
@@ -523,8 +521,6 @@ def list_products(
             )
         except Exception as exc:
             _LOGGER.warning("MySQL list_products failed, falling back: %s", exc)
-        finally:
-            mysql_conn.close()
     return _list_products_sqlite(
         database_path, query=query, product_type=product_type,
         category_id=category_id, stock_status=stock_status,
@@ -745,8 +741,6 @@ def product_filter_options(database_path: Path) -> dict[str, Any]:
             return _product_filter_options_mysql(mysql_conn)
         except Exception as exc:
             _LOGGER.warning("MySQL product_filter_options failed: %s", exc)
-        finally:
-            mysql_conn.close()
     return _product_filter_options_sqlite(database_path)
 
 
@@ -845,8 +839,6 @@ def product_detail(database_path: Path, product_id: str) -> dict[str, Any] | Non
             return product
         except Exception as exc:
             _LOGGER.warning("MySQL product_detail failed: %s", exc)
-        finally:
-            mysql_conn.close()
     connection = _connect(database_path)
     if connection is None:
         return None
@@ -888,8 +880,6 @@ def diagnostics(database_path: Path, limit: int = 100) -> list[dict[str, Any]]:
             ]
         except Exception as exc:
             _LOGGER.warning("MySQL diagnostics failed: %s", exc)
-        finally:
-            mysql_conn.close()
     connection = _connect(database_path)
     if connection is None:
         return []
