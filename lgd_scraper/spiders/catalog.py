@@ -30,7 +30,14 @@ def _text(values: Iterable[str | None]) -> str:
 def _clean_html(value: Any) -> str:
     if not value:
         return ""
-    return _text(scrapy.Selector(text=str(value)).xpath("//text()").getall())
+    text = str(value)
+    # If the value doesn't contain HTML tags, decode entities and return.
+    if "<" not in text:
+        return html.unescape(text).strip()
+    # Force type='html' so Scrapy doesn't auto-detect JSON-like values
+    # (e.g. variation details starting with '{' or '[') as type='json',
+    # which would raise ValueError on .xpath().
+    return _text(scrapy.Selector(text=text, type="html").xpath("//text()").getall())
 
 
 class WooCommerceCatalogSpider(scrapy.Spider):
