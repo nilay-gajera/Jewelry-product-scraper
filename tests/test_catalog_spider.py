@@ -916,3 +916,43 @@ def test_diamond_product_404_retries_with_public_diamond_sku_url():
     assert emitted["diamond_details"]["clarity"] == "VVS2"
     assert emitted["html_enrichment"]["status"] == "complete"
 
+
+def test_product_redirect_to_homepage_does_not_corrupt_product_data():
+    spider = WooCommerceCatalogSpider(enrich_html=True)
+    product = {
+        "_record_type": "product",
+        "id": "100",
+        "name": "Hidden Diamond",
+        "sku": "SKU-999",
+        "url": "https://www.loosegrowndiamond.com/product/hidden-diamond/",
+        "product_family": "loose_diamond",
+        "type": "simple",
+    }
+
+    # Simulate redirect to homepage (path: /)
+    homepage_html = b"<body class='home'><main><h1>Shop Loose Lab Grown Diamonds</h1></main></body>"
+    req = Request(product["url"], meta={"redirect_urls": [product["url"]]})
+    resp = HtmlResponse(
+        url="https://www.loosegrowndiamond.com/", status=200, body=homepage_html, encoding="utf-8", request=req
+    )
+
+    # First attempt: detects homepage redirect, retries with /diamond/{sku}/
+    items = list(spider.parse_product_page(resp, api_product=product))
+    assert len(items) == 1
+    assert isinstance(items[0], Request)
+    assert items[0].url == "https://www.loosegrowndiamond.com/diamond/SKU-999/"
+
+    # Second attempt: if /diamond/{sku}/ also redirects to homepage, marks unavailable without corrupting data
+    retry_req = items[0]
+    resp2 = HtmlResponse(
+        url="https://www.loosegrowndiamond.com/", status=200, body=homepage_html, encoding="utf-8", request=retry_req
+    )
+    final_items = list(spider.parse_product_page(resp2, api_product=product))
+    emitted = next(item for item in final_items if item.get("_record_type") == "product")
+    # Name and URL remain the original API values, not homepage data
+    assert emitted["name"] == "Hidden Diamond"
+    assert emitted["url"] == "https://www.loosegrowndiamond.com/product/hidden-diamond/"
+    assert emitted["html_enrichment"]["status"] == "unavailable"
+    assert emitted["html_enrichment"]["reason"] == "redirected_to_non_product_page"
+
+

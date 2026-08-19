@@ -614,6 +614,42 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 yield from self._emit_product(product)
             return
 
+        # Check if a redirect landed on a non-product page (e.g. homepage or archive)
+        if self._is_non_product_landing(response):
+            sku = str(product.get("sku") or "").strip()
+            tried_alternate = response.meta.get("tried_alternate_url", False)
+            if not tried_alternate and sku and "/diamond/" not in response.url:
+                meta = dict(response.meta)
+                meta["tried_alternate_url"] = True
+                yield Request(
+                    urljoin(self.base_url, f"diamond/{quote(sku)}/"),
+                    callback=self.parse_product_page,
+                    cb_kwargs={"api_product": product},
+                    meta=meta,
+                    errback=self.errback_request,
+                    dont_filter=True,
+                )
+                return
+
+            if api_product is not None:
+                product["html_enrichment"] = {
+                    "status": "unavailable",
+                    "reason": "redirected_to_non_product_page",
+                    "redirect_to": response.url,
+                }
+                product["enrichment_schema_version"] = self.ENRICHMENT_SCHEMA_VERSION
+                if (
+                    not self.authenticated
+                    and product.get("type") == "variable"
+                    and not product.get("variations")
+                ):
+                    yield self._store_variation_request(product, page=1, variations=[])
+                elif product.get("variations"):
+                    yield from self._finish_product(product)
+                else:
+                    yield from self._emit_product(product)
+                return
+
         product["source"] = (
             f"{product.get('source')}+html" if product.get("source") else "html"
         )
@@ -2419,6 +2455,36 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         url = urljoin(self.base_url, path)
         filtered = {key: value for key, value in query.items() if value is not None}
         return f"{url}?{urlencode(filtered)}" if filtered else url
+
+    @staticmethod
+    def _is_non_product_landing(response: Response) -> bool:
+        """Detect when a product request was redirected to the homepage or an archive page."""
+        parsed = urlparse(response.url)
+        path = parsed.path.rstrip("/")
+        if not path or path == "":
+            return True
+        non_product_prefixes = (
+            "/lab-diamonds",
+            "/shop",
+            "/product-category",
+            "/category",
+            "/cart",
+            "/checkout",
+            "/my-account",
+            "/contact",
+            "/about",
+            "/blog",
+        )
+        if any(path == prefix or path.startswith(f"{prefix}/") for prefix in non_product_prefixes):
+            return True
+        body_class = str(response.css("body::attr(class)").get("") or "").lower()
+        if body_class:
+            tokens = set(body_class.split())
+            if ("home" in tokens or "archive" in tokens or "blog" in tokens) and (
+                "single-product" not in tokens and "single-diamond" not in tokens
+            ):
+                return True
+        return False
 
     def _diamond_page_url(self, product: dict[str, Any]) -> str:
         """Return the authoritative single diamond page URL on loosegrowndiamond.com."""
