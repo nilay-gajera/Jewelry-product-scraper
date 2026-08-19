@@ -18,8 +18,8 @@ WORKDIR /app
 
 COPY . .
 COPY --from=admin-build /app/admin_dist ./admin_dist
-RUN python -m pip install --upgrade pip \
-    && python -m pip install .
+RUN python -m pip install --root-user-action=ignore --upgrade pip \
+    && python -m pip install --root-user-action=ignore .
 
 EXPOSE 10000
 
