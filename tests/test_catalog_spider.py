@@ -860,3 +860,59 @@ def test_json_ld_product_group_is_preserved_as_variation_fallback():
         media["role"] == "variation_gallery"
         for media in fallback_product["media"]
     ) == 1
+
+
+def test_diamond_product_404_retries_with_public_diamond_sku_url():
+    spider = WooCommerceCatalogSpider(enrich_html=True)
+    product = {
+        "_record_type": "product",
+        "id": "2316967",
+        "name": "Radiant Cut 3.07 Carat D Color VVS2 Clarity Lab Grown Diamond",
+        "sku": "813614517",
+        "url": "https://www.loosegrowndiamond.com/product/radiant-cut-3-07-carat-d-color-vvs2-clarity-lab-grown-diamond-813614517/",
+        "product_family": "loose_diamond",
+        "type": "simple",
+    }
+
+    # Simulate 404 on the WooCommerce /product/... URL
+    first_req = Request(product["url"])
+    first_resp = HtmlResponse(
+        url=product["url"], status=404, body=b"Page not found", encoding="utf-8", request=first_req
+    )
+
+    retry_items = list(spider.parse_product_page(first_resp, api_product=product))
+    assert len(retry_items) == 1
+    retry_req = retry_items[0]
+    assert isinstance(retry_req, Request)
+    assert retry_req.url == "https://www.loosegrowndiamond.com/diamond/813614517/"
+
+    # Simulate 200 on the /diamond/{sku}/ URL with diamond details grid
+    grid_html = """
+    <html><body>
+    <div class="diamond-details-grid">
+        <div class="dd-item">
+            <div class="dd-label">Carat</div>
+            <div class="dd-value"><span class="fw-bold">3.07</span></div>
+        </div>
+        <div class="dd-item">
+            <div class="dd-label">Color</div>
+            <div class="dd-value"><span class="fw-bold">D</span></div>
+        </div>
+        <div class="dd-item">
+            <div class="dd-label">Clarity</div>
+            <div class="dd-value"><span class="fw-bold">VVS2</span></div>
+        </div>
+    </div>
+    </body></html>
+    """.encode("utf-8")
+
+    second_resp = HtmlResponse(
+        url=retry_req.url, status=200, body=grid_html, encoding="utf-8", request=retry_req
+    )
+    final_items = list(spider.parse_product_page(second_resp, api_product=product))
+    emitted = next(item for item in final_items if item.get("_record_type") == "product")
+    assert emitted["diamond_details"]["carat"] == 3.07
+    assert emitted["diamond_details"]["color"] == "D"
+    assert emitted["diamond_details"]["clarity"] == "VVS2"
+    assert emitted["html_enrichment"]["status"] == "complete"
+

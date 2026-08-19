@@ -9,7 +9,7 @@ import sqlite3
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import scrapy
 from scrapy import Request
@@ -315,8 +315,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                             continue
                         product["_record_type"] = "product"
                         self.products_scheduled += 1
+                        target_url = (
+                            self._diamond_page_url(product)
+                            if product.get("product_family") == "loose_diamond" and product.get("sku")
+                            else str(product["url"])
+                        )
                         yield self._page_request(
-                            str(product["url"]), product, dont_filter=True
+                            target_url, product, dont_filter=True
                         )
                 self.logger.info(
                     "Enrichment: scheduled=%d, already_enriched=%d, "
@@ -537,6 +542,31 @@ class WooCommerceCatalogSpider(scrapy.Spider):
     def parse_product_page(self, response: Response, api_product: dict[str, Any] | None = None):
         product = dict(api_product or self._product_shell(response))
         if response.status == 404 and api_product is not None:
+            # If a diamond page returned 404, attempt an alternate URL before giving up:
+            # 1. If we tried /product/... and it 404'd, try /diamond/{sku}/
+            # 2. If we tried /diamond/{sku}/ and it 404'd, try the original /product/... URL
+            sku = str(product.get("sku") or "").strip()
+            tried_alternate = response.meta.get("tried_alternate_url", False)
+            if not tried_alternate and sku:
+                alternate_url = None
+                if "/diamond/" not in response.url:
+                    alternate_url = urljoin(self.base_url, f"diamond/{quote(sku)}/")
+                elif product.get("url") and str(product["url"]) != response.url:
+                    alternate_url = str(product["url"])
+
+                if alternate_url and alternate_url != response.url:
+                    meta = dict(response.meta)
+                    meta["tried_alternate_url"] = True
+                    yield Request(
+                        alternate_url,
+                        callback=self.parse_product_page,
+                        cb_kwargs={"api_product": product},
+                        meta=meta,
+                        errback=self.errback_request,
+                        dont_filter=True,
+                    )
+                    return
+
             # Some Store API diamond records publish a legacy detail permalink
             # that no longer has an HTML route. The API record remains valid and
             # complete enough to export, so treat HTML enrichment as optional.
@@ -1114,7 +1144,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         }
         values: dict[str, Any] = {}
         fields: dict[str, dict[str, str]] = {}
-        for item in response.css(".diamond-details-grid .dd-item"):
+        items = response.css(
+            ".diamond-details-grid .dd-item, "
+            ".diamond-details .dd-item, "
+            ".diamond_details .dd-item, "
+            ".diamond-specifications .dd-item"
+        )
+        for item in items:
             label = _text(item.css(".dd-label *::text, .dd-label::text").getall())
             value_node = item.css(".dd-value")
             if not label or not value_node:
@@ -1143,6 +1179,29 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             canonical_key = label_aliases.get(self._diamond_label(label))
             if canonical_key:
                 values.setdefault(canonical_key, primary)
+
+        # Fallback to tables with th/td pairs if grid was not present
+        if not fields:
+            for row in response.css(
+                "table.diamond-details tr, table.diamond-specs tr, "
+                "table.shop_attributes tr, .woocommerce-product-attributes tr"
+            ):
+                label = _text(row.css("th::text, th *::text, .label::text").getall()).rstrip(":")
+                value_node = row.css("td")
+                if not label or not value_node:
+                    continue
+                primary = _text(value_node.css("*::text, ::text").getall())
+                if not primary:
+                    continue
+                field_key = re.sub(
+                    r"[^a-z0-9]+", "_", self._diamond_label(label)
+                ).strip("_")
+                if not field_key:
+                    continue
+                fields[field_key] = {"label": label, "value": primary}
+                canonical_key = label_aliases.get(self._diamond_label(label))
+                if canonical_key:
+                    values.setdefault(canonical_key, primary)
 
         if not fields:
             return
@@ -2360,6 +2419,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         url = urljoin(self.base_url, path)
         filtered = {key: value for key, value in query.items() if value is not None}
         return f"{url}?{urlencode(filtered)}" if filtered else url
+
+    def _diamond_page_url(self, product: dict[str, Any]) -> str:
+        """Return the authoritative single diamond page URL on loosegrowndiamond.com."""
+        sku = str(product.get("sku") or "").strip()
+        if sku:
+            return urljoin(self.base_url, f"diamond/{quote(sku)}/")
+        return str(product.get("url") or "")
 
     @staticmethod
     def _slug(value: str) -> str:
