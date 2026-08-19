@@ -136,6 +136,10 @@ class CatalogWriterPipeline:
 
     COMMIT_BATCH_SIZE = 50
     PROGRESS_INTERVAL = 100
+    # Upper bound on remembered diagnostic keys. A long crawl against a broken
+    # source can otherwise accumulate one tuple per distinct failure for the
+    # life of the process.
+    MAX_DIAGNOSTIC_KEYS = 50_000
 
     def __init__(self):
         self.output_dir = Path("outputs/catalog")
@@ -154,8 +158,8 @@ class CatalogWriterPipeline:
         instance.crawler = crawler
         return instance
 
-    def open_spider(self, spider=None):
-        spider = spider or (self.crawler.spider if self.crawler else None)
+    def open_spider(self, *args, **kwargs):
+        spider = args[0] if args else (self.crawler.spider if self.crawler else None)
         self.output_dir = Path(getattr(spider, "output_dir", "outputs/catalog")).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.progress_path = self.output_dir / "progress.json"
@@ -264,7 +268,8 @@ class CatalogWriterPipeline:
         self.connection.execute("DELETE FROM diagnostics")
         self.connection.commit()
 
-    def process_item(self, item, spider=None):
+    def process_item(self, item, *args, **kwargs):
+        spider = args[0] if args else (self.crawler.spider if self.crawler else None)
         record_type = item.get("_record_type", "product")
         if record_type == "diagnostic":
             key = (
@@ -275,7 +280,7 @@ class CatalogWriterPipeline:
             )
             if key in self.diagnostics_seen:
                 return item
-            self.diagnostics_seen.add(key)
+            self._remember_diagnostic(key)
         self.counts[record_type] += 1
 
         if record_type == "product":
@@ -305,7 +310,7 @@ class CatalogWriterPipeline:
                     diagnostic["message"],
                 )
                 if key not in self.diagnostics_seen:
-                    self.diagnostics_seen.add(key)
+                    self._remember_diagnostic(key)
                     self.counts["diagnostic"] += 1
                     self._write_jsonl("diagnostics", diagnostic)
                     self._store_diagnostic(diagnostic)
@@ -328,6 +333,11 @@ class CatalogWriterPipeline:
         if total % self.PROGRESS_INTERVAL == 0:
             self._write_progress(item, spider=spider)
         return item
+
+    def _remember_diagnostic(self, key: tuple[Any, ...]) -> None:
+        if len(self.diagnostics_seen) >= self.MAX_DIAGNOSTIC_KEYS:
+            self.diagnostics_seen.clear()
+        self.diagnostics_seen.add(key)
 
     def _write_progress(
         self, item: dict[str, Any] | None = None, spider: Any = None
@@ -602,20 +612,40 @@ class CatalogWriterPipeline:
             ),
         )
 
-    def close_spider(self, spider=None):
-        spider = spider or (self.crawler.spider if self.crawler else None)
+    def close_spider(self, *args, **kwargs):
+        spider = args[0] if args else (self.crawler.spider if self.crawler else None)
         assert self.connection is not None
         self.connection.commit()
         for handle in self.handles.values():
             handle.close()
-        write_jsonl_exports(self.connection, self.output_dir)
-        self._export_csvs()
-        self.woocommerce_counts = export_woocommerce_csvs(
-            self.connection,
-            self.output_dir,
-            public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
-        )
+
+        # Export failures must never cost the run its S3 checkpoint. Record the
+        # problem and keep going: the SQLite database is the durable artifact
+        # and the CSVs can be rebuilt from it afterwards.
+        export_error: str | None = None
+        try:
+            write_jsonl_exports(self.connection, self.output_dir)
+            self._export_csvs()
+            self.woocommerce_counts = export_woocommerce_csvs(
+                self.connection,
+                self.output_dir,
+                public_base_url=os.getenv("S3_PUBLIC_BASE_URL"),
+            )
+        except Exception as exc:
+            export_error = str(exc)
+            self.woocommerce_counts = {}
+            self._store_diagnostic(
+                {
+                    "kind": "export_failed",
+                    "url": None,
+                    "status": None,
+                    "message": f"Catalog exports could not be written: {exc}",
+                }
+            )
+            self.connection.commit()
+
         summary = {
+            "export_error": export_error,
             "run_id": os.getenv("SCRAPER_RUN_ID"),
             "base_url": getattr(spider, "base_url", None),
             "records_seen_this_run": dict(self.counts),
@@ -642,21 +672,23 @@ class CatalogWriterPipeline:
                 "already_current": getattr(spider, "products_already_enriched", 0),
             },
         }
-        (self.output_dir / "crawl-summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        progress = {
-            "run_id": os.getenv("SCRAPER_RUN_ID"),
-            "state": "completed",
-            "records_seen": dict(self.counts),
-            "summary": summary,
-        }
-        self.progress_path.write_text(
-            json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-
-        self.connection.close()
-        upload_final_artifacts(self.output_dir)
+        try:
+            (self.output_dir / "crawl-summary.json").write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            progress = {
+                "run_id": os.getenv("SCRAPER_RUN_ID"),
+                "state": "completed",
+                "records_seen": dict(self.counts),
+                "summary": summary,
+            }
+            self.progress_path.write_text(
+                json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        finally:
+            self.connection.close()
+            self.connection = None
+            upload_final_artifacts(self.output_dir)
 
     def _export_csvs(self) -> None:
         assert self.connection is not None

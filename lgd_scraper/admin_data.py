@@ -29,7 +29,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "enrich_html": True,
     "download_media": True,
     "resume_checkpoint": True,
-    "obey_robots": True,
+    "obey_robots": False,
     "category_ids": [],
 }
 
@@ -129,9 +129,14 @@ def _connect(database_path: Path) -> sqlite3.Connection | None:
     return connection
 
 
-def _connect_mysql():
-    """Return a MySQL connection or None if MySQL is not configured/reachable."""
-    if not mysql_enabled():
+def _connect_mysql(prefer_sqlite: bool = False):
+    """Return a MySQL connection or None if MySQL is not configured/reachable.
+
+    ``prefer_sqlite`` forces the local checkpoint. MySQL is only a read replica
+    refreshed after a crawl finishes, so while a crawl is writing local SQLite
+    the replica is stale and must not be used.
+    """
+    if prefer_sqlite or not mysql_enabled():
         return None
     try:
         return mysql_read_connect()
@@ -257,8 +262,10 @@ def _empty_summary() -> dict[str, Any]:
     }
 
 
-def catalog_summary(database_path: Path) -> dict[str, Any]:
-    mysql_conn = _connect_mysql()
+def catalog_summary(
+    database_path: Path, *, prefer_sqlite: bool = False
+) -> dict[str, Any]:
+    mysql_conn = _connect_mysql(prefer_sqlite)
     if mysql_conn is not None:
         try:
             return _catalog_summary_mysql(mysql_conn)
@@ -510,8 +517,9 @@ def list_products(
     sort: str = "name_asc",
     page: int = 1,
     page_size: int = 25,
+    prefer_sqlite: bool = False,
 ) -> dict[str, Any]:
-    mysql_conn = _connect_mysql()
+    mysql_conn = _connect_mysql(prefer_sqlite)
     if mysql_conn is not None:
         try:
             return _list_products_mysql(
@@ -732,10 +740,12 @@ def _list_products_sqlite(
         connection.close()
 
 
-def product_filter_options(database_path: Path) -> dict[str, Any]:
+def product_filter_options(
+    database_path: Path, *, prefer_sqlite: bool = False
+) -> dict[str, Any]:
     """Return compact filter facets for the product administration page."""
 
-    mysql_conn = _connect_mysql()
+    mysql_conn = _connect_mysql(prefer_sqlite)
     if mysql_conn is not None:
         try:
             return _product_filter_options_mysql(mysql_conn)
@@ -821,8 +831,10 @@ def _product_filter_options_sqlite(database_path: Path) -> dict[str, Any]:
         connection.close()
 
 
-def product_detail(database_path: Path, product_id: str) -> dict[str, Any] | None:
-    mysql_conn = _connect_mysql()
+def product_detail(
+    database_path: Path, product_id: str, *, prefer_sqlite: bool = False
+) -> dict[str, Any] | None:
+    mysql_conn = _connect_mysql(prefer_sqlite)
     if mysql_conn is not None:
         try:
             row = _mysql_fetchone(
@@ -857,8 +869,10 @@ def product_detail(database_path: Path, product_id: str) -> dict[str, Any] | Non
         connection.close()
 
 
-def diagnostics(database_path: Path, limit: int = 100) -> list[dict[str, Any]]:
-    mysql_conn = _connect_mysql()
+def diagnostics(
+    database_path: Path, limit: int = 100, *, prefer_sqlite: bool = False
+) -> list[dict[str, Any]]:
+    mysql_conn = _connect_mysql(prefer_sqlite)
     if mysql_conn is not None:
         try:
             rows = _mysql_fetchall(

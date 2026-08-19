@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -48,26 +49,74 @@ def mysql_connect(*, autocommit: bool = False):
     )
 
 
-# Module-level cached connection for read-only admin dashboard queries.
-# Avoids creating a new TCP connection (~50ms to Hostinger) per API call.
-_read_connection = None
+# Cached read-only connection for admin dashboard queries. Avoids creating a
+# new TCP connection (~50ms to Hostinger) per API call.
+#
+# PyMySQL is threadsafety=1: a connection must never be shared between threads.
+# FastAPI runs every synchronous endpoint in its own worker thread, so the cache
+# is per-thread rather than per-process.
+_read_state = threading.local()
 
 
 def mysql_read_connect():
-    """Return a cached read-only connection, reconnecting if stale."""
-    global _read_connection
-    if _read_connection is not None:
+    """Return this thread's cached read-only connection, reconnecting if stale."""
+
+    connection = getattr(_read_state, "connection", None)
+    if connection is not None:
         try:
-            _read_connection.ping(reconnect=True)
-            return _read_connection
+            connection.ping(reconnect=True)
+            return connection
         except Exception:
             try:
-                _read_connection.close()
+                connection.close()
             except Exception:
                 pass
-            _read_connection = None
-    _read_connection = mysql_connect(autocommit=True)
-    return _read_connection
+            _read_state.connection = None
+    connection = mysql_connect(autocommit=True)
+    _read_state.connection = connection
+    return connection
+
+
+def delete_products_mysql(product_ids: list[str]) -> int:
+    """Remove products and their relationships from the MySQL read replica.
+
+    Deleting from SQLite alone leaves the dashboard reading stale rows, because
+    every admin query prefers MySQL when it is configured.
+    """
+
+    ids = list(
+        dict.fromkeys(
+            str(product_id).strip()
+            for product_id in product_ids
+            if str(product_id).strip()
+        )
+    )
+    if not ids or not mysql_enabled():
+        return 0
+
+    connection = mysql_connect()
+    try:
+        cursor = connection.cursor()
+        placeholders = ", ".join(["%s"] * len(ids))
+        for table in (
+            "product_categories",
+            "product_attributes",
+            "variations",
+            "images",
+        ):
+            cursor.execute(
+                f"DELETE FROM {table} WHERE product_id IN ({placeholders})", ids
+            )
+        cursor.execute(f"DELETE FROM products WHERE id IN ({placeholders})", ids)
+        deleted = cursor.rowcount
+        cursor.close()
+        connection.commit()
+        return deleted
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 # ---------------------------------------------------------------------------

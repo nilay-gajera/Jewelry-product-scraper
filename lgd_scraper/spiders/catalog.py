@@ -597,6 +597,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 "product_page_unavailable",
                 f"Product page could not be read (HTTP {response.status}).",
             )
+            if api_product is None:
+                # Nothing but the failed page describes this product, so there
+                # is no record worth storing. Emitting the shell would write a
+                # nameless, priceless row into the catalog.
+                return
             if blocked:
                 # A geographic/firewall denial applies to the whole run. Keep
                 # the saved product unchanged and stop before scheduling tens
@@ -631,6 +636,15 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 )
                 return
 
+            if api_product is None:
+                yield {
+                    "_record_type": "diagnostic",
+                    "kind": "product_page_redirected",
+                    "url": response.url,
+                    "status": response.status,
+                    "message": "A sitemap product URL redirected to a non-product page.",
+                }
+                return
             if api_product is not None:
                 product["html_enrichment"] = {
                     "status": "unavailable",
@@ -1958,7 +1972,14 @@ class WooCommerceCatalogSpider(scrapy.Spider):
 
         for select in response.css("form.variations_form select"):
             select_name = select.attrib.get("name", "")
-            label = response.css(f"label[for='{select.attrib.get('id', '')}']::text").get()
+            # XPath variable binding: the id comes from scraped markup and a
+            # quote in it would otherwise produce an invalid selector.
+            select_id = select.attrib.get("id", "")
+            label = (
+                response.xpath("//label[@for=$for_id]/text()", for_id=select_id).get()
+                if select_id
+                else None
+            )
             name = (
                 (label or "")
                 .strip()

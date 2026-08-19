@@ -9,11 +9,15 @@ import sqlite3
 import tempfile
 import zipfile
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 
 LOGGER = logging.getLogger(__name__)
+
+# Upper bound on run records scanned for the admin runs listing.
+MAX_RUN_KEYS = 5000
 
 
 def s3_enabled() -> bool:
@@ -24,13 +28,24 @@ def s3_prefix() -> str:
     return os.getenv("S3_PREFIX", "jewelry-product-scraper").strip("/")
 
 
-def s3_client():
+@lru_cache(maxsize=None)
+def _build_s3_client(region: str | None, endpoint: str | None):
     import boto3
 
-    return boto3.client(
-        "s3",
-        region_name=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
-        endpoint_url=os.getenv("AWS_ENDPOINT_URL") or None,
+    return boto3.client("s3", region_name=region, endpoint_url=endpoint)
+
+
+def s3_client():
+    """Return a shared boto3 client.
+
+    Constructing a client costs ~100ms (session, loaders, endpoint resolution)
+    and ``public_media_url`` needs one per thumbnail. botocore clients are
+    thread-safe, so one per credential/endpoint combination is enough.
+    """
+
+    return _build_s3_client(
+        os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
+        os.getenv("AWS_ENDPOINT_URL") or None,
     )
 
 
@@ -87,24 +102,28 @@ def list_admin_runs(limit: int = 50) -> list[dict[str, Any]]:
         return []
     client = s3_client()
     prefix = _key("admin", "runs") + "/"
+    # S3 truncates a listing in ascending key order, and run ids are ascending
+    # UTC timestamps, so MaxKeys=limit would return the OLDEST runs and hide
+    # every new one once the bucket held more than ``limit`` records. Page
+    # through the keys first, then keep the newest by name.
+    keys: list[str] = []
     try:
-        response = client.list_objects_v2(
-            Bucket=os.environ["S3_BUCKET"], Prefix=prefix, MaxKeys=max(1, limit)
-        )
+        for page in client.get_paginator("list_objects_v2").paginate(
+            Bucket=os.environ["S3_BUCKET"],
+            Prefix=prefix,
+            PaginationConfig={"MaxItems": MAX_RUN_KEYS},
+        ):
+            keys.extend(
+                str(item.get("Key") or "")
+                for item in page.get("Contents", [])
+                if str(item.get("Key") or "").endswith(".json")
+            )
     except Exception as exc:
         LOGGER.warning("Could not list S3 run records: %s", exc)
         return []
 
     records: list[dict[str, Any]] = []
-    objects = sorted(
-        response.get("Contents", []),
-        key=lambda item: item.get("LastModified") or datetime.min.replace(tzinfo=UTC),
-        reverse=True,
-    )
-    for item in objects[:limit]:
-        key = str(item.get("Key") or "")
-        if not key.endswith(".json"):
-            continue
+    for key in sorted(keys, reverse=True)[:limit]:
         try:
             payload = client.get_object(
                 Bucket=os.environ["S3_BUCKET"], Key=key
@@ -351,13 +370,13 @@ class S3ArtifactPipeline:
         instance.crawler = crawler
         return instance
 
-    def open_spider(self, spider):
-        spider = self.crawler.spider
+    def open_spider(self, *args, **kwargs):
+        spider = args[0] if args else getattr(self.crawler, "spider", None)
         self.output_dir = Path(
             getattr(spider, "output_dir", "outputs/catalog")
         ).resolve()
 
-    def process_item(self, item, spider):
+    def process_item(self, item, *args, **kwargs):
         if not self.bucket or item.get("_record_type") != "product":
             return item
         self.products_seen += 1
@@ -443,20 +462,22 @@ class S3ArtifactPipeline:
                 for path in upload_files:
                     archive.write(path, arcname=path.name)
 
+            # The historical run branch gets the archive only. Uploading every
+            # artifact there as well doubled egress and wall clock for data the
+            # zip already contains.
+            for path in upload_files:
+                client.upload_file(
+                    str(path),
+                    self.bucket,
+                    _key("latest", path.name),
+                    ExtraArgs=_extra_args(),
+                )
+
             branches = (
                 ("latest", f"runs/{run_id}")
                 if include_run_archive
                 else ("latest",)
             )
-            for path in upload_files:
-                for branch in branches:
-                    client.upload_file(
-                        str(path),
-                        self.bucket,
-                        _key(branch, path.name),
-                        ExtraArgs=_extra_args(),
-                    )
-
             for branch in branches:
                 client.upload_file(
                     str(archive_path),

@@ -8,7 +8,7 @@ BOT_NAME = "lgd_scraper"
 SPIDER_MODULES = ["lgd_scraper.spiders"]
 NEWSPIDER_MODULE = "lgd_scraper.spiders"
 
-ROBOTSTXT_OBEY = os.getenv("SCRAPER_OBEY_ROBOTS", "1").strip().lower() in {
+ROBOTSTXT_OBEY = os.getenv("SCRAPER_OBEY_ROBOTS", "0").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -34,7 +34,15 @@ RETRY_ENABLED = True
 RETRY_TIMES = int(os.getenv("SCRAPER_RETRY_TIMES", "3"))
 RETRY_HTTP_CODES = [408, 425, 429, 500, 502, 503, 504, 522, 524]
 
-HTTPCACHE_ENABLED = True
+# Off by default. The cache stores every response body with no size cap, so a
+# 40K-product crawl writes several GB to an ephemeral container disk. Enable it
+# deliberately (SCRAPER_HTTPCACHE=1) for local development against a live site.
+HTTPCACHE_ENABLED = os.getenv("SCRAPER_HTTPCACHE", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 HTTPCACHE_DIR = "work/httpcache"
 HTTPCACHE_EXPIRATION_SECS = int(os.getenv("SCRAPER_HTTPCACHE_EXPIRY", "86400"))  # 24h
 HTTPCACHE_IGNORE_HTTP_CODES = [307, 401, 403, 408, 425, 429, 500, 502, 503, 504]

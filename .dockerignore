@@ -10,3 +10,10 @@ runtime
 work
 outputs
 lgd_woocommerce_catalog_scraper.egg-info
+node_modules
+admin/node_modules
+admin_dist
+.DS_Store
+**/.DS_Store
+.env
+.env.local

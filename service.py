@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -39,7 +41,11 @@ from lgd_scraper.catalog_mutations import (
     unreferenced_media_paths,
 )
 from lgd_scraper.discovery import CatalogDiscoveryError, discover_catalog
-from lgd_scraper.mysql_backend import mysql_enabled, sync_from_sqlite
+from lgd_scraper.mysql_backend import (
+    delete_products_mysql,
+    mysql_enabled,
+    sync_from_sqlite,
+)
 from lgd_scraper.s3sync import (
     delete_media_objects,
     download_checkpoint,
@@ -72,6 +78,11 @@ RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 state_lock = threading.Lock()
+# ``state_lock`` is only ever held for in-memory state reads and writes.
+# Catalog work (master export, deletion) can run for minutes, so it takes its
+# own lock and must never hold ``state_lock`` while doing I/O -- otherwise the
+# 5-second dashboard poll blocks behind it and the request threadpool fills.
+catalog_lock = threading.Lock()
 process: subprocess.Popen[str] | None = None
 
 
@@ -203,6 +214,33 @@ def _read_json(path: Path) -> Any:
         return None
 
 
+def _tail(path: Path, lines: int, block_size: int = 64 * 1024) -> str:
+    """Return the last ``lines`` lines without reading the whole file.
+
+    The dashboard polls this every five seconds while a crawl runs, and a long
+    crawl log does not fit comfortably in a 512 MB instance.
+    """
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = position = handle.tell()
+            chunks: list[bytes] = []
+            while position > 0 and sum(chunk.count(b"\n") for chunk in chunks) <= lines:
+                read_size = min(block_size, position)
+                position -= read_size
+                handle.seek(position)
+                chunks.append(handle.read(read_size))
+            data = b"".join(reversed(chunks))[-(end - position) :]
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""
+    return "\n".join(
+        data.decode("utf-8", errors="replace").splitlines()[-lines:]
+    )
+
+
 def _read_state() -> dict[str, Any]:
     state = _read_json(STATUS_PATH)
     if not isinstance(state, dict):
@@ -286,7 +324,9 @@ def _require_control(authorization: str | None = Header(default=None)) -> None:
     supplied = ""
     if authorization and authorization.startswith("Bearer "):
         supplied = authorization.removeprefix("Bearer ").strip()
-    if not secrets.compare_digest(supplied, expected):
+    if not secrets.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(401, "Invalid control token.")
 
 
@@ -340,6 +380,27 @@ def _configure_crawl_environment(config: dict[str, Any], run_id: str) -> dict[st
         environment["HTTPS_PROXY"] = proxy
         environment["HTTP_PROXY"] = proxy
     return environment
+
+
+def _prune_old_jobdirs(current_run_id: str, keep: int = 3) -> None:
+    """Drop Scrapy job directories from earlier runs.
+
+    One directory is created per run and nothing removed them, which slowly
+    fills the container disk on long-lived deployments.
+    """
+
+    jobs_dir = RUNTIME_DIR / "jobs"
+    if not jobs_dir.is_dir():
+        return
+    directories = sorted(
+        (path for path in jobs_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for path in directories[keep:]:
+        if path.name == current_run_id:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _clear_local_catalog() -> None:
@@ -417,15 +478,18 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
         if process is current_process:
             process = None
 
-    # Sync catalog to MySQL (non-blocking, best-effort)
-    if successful and mysql_enabled():
-        try:
-            sync_from_sqlite(DATABASE_PATH)
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Post-crawl MySQL sync failed: %s", exc
-            )
+    # Refresh the MySQL read replica. A stopped or warned run still produced
+    # real rows and a real checkpoint, so anything that reached a terminal
+    # state with a database on disk is worth syncing -- otherwise the dashboard
+    # keeps serving the previous run's catalog.
+    if final_state != "failed" and mysql_enabled() and DATABASE_PATH.exists():
+        with catalog_lock:
+            try:
+                sync_from_sqlite(DATABASE_PATH)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Post-crawl MySQL sync failed: %s", exc
+                )
 
 
 @app.get("/health")
@@ -442,10 +506,11 @@ def session() -> dict[str, Any]:
 def status() -> dict[str, Any]:
     with state_lock:
         state = _read_state()
-        state["process_running"] = _process_running()
+        running = _process_running()
+        state["process_running"] = running
     progress = _read_json(PROGRESS_PATH)
     state["progress"] = progress if isinstance(progress, dict) else None
-    state["catalog"] = catalog_summary(DATABASE_PATH)
+    state["catalog"] = catalog_summary(DATABASE_PATH, prefer_sqlite=running)
     return state
 
 
@@ -455,18 +520,19 @@ def status() -> dict[str, Any]:
     response_class=PlainTextResponse,
 )
 def logs(lines: int = Query(default=250, ge=20, le=2000)) -> str:
-    if not LOG_PATH.exists():
-        return ""
-    values = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(values[-lines:])
+    return _tail(LOG_PATH, lines)
 
 
 @app.post("/api/start", dependencies=[Depends(_require_control)])
 def start_crawl(request: StartRequest) -> dict[str, Any]:
     global process
-    with state_lock:
-        if _process_running():
-            raise HTTPException(409, "A crawl is already running.")
+    # Restoring the S3 checkpoint downloads and verifies the whole database.
+    # ``catalog_lock`` serializes starts against each other and against catalog
+    # mutations; ``state_lock`` is taken only for the short state updates.
+    with catalog_lock:
+        with state_lock:
+            if _process_running():
+                raise HTTPException(409, "A crawl is already running.")
 
         config = _merged_start_settings(request)
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -514,8 +580,12 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
             "-a",
             "use_playwright=false",
         ]
+        _prune_old_jobdirs(run_id)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         log_handle = LOG_PATH.open("w", encoding="utf-8")
+        with state_lock:
+            if _process_running():
+                raise HTTPException(409, "A crawl is already running.")
         process = subprocess.Popen(
             command,
             cwd=PROJECT_DIR,
@@ -540,7 +610,8 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
                 else "Crawl is running. Checkpoints are saved to S3."
             ),
         }
-        _write_state(state)
+        with state_lock:
+            _write_state(state)
         _persist_run(state)
         threading.Thread(
             target=_watch_process, args=(process, run_id), daemon=True
@@ -577,7 +648,7 @@ def stop_crawl() -> dict[str, str]:
 
 @app.get("/api/catalog/summary", dependencies=[Depends(_require_control)])
 def get_catalog_summary() -> dict[str, Any]:
-    return catalog_summary(DATABASE_PATH)
+    return catalog_summary(DATABASE_PATH, prefer_sqlite=_process_running())
 
 
 @app.get("/api/discovery", dependencies=[Depends(_require_control)])
@@ -639,12 +710,13 @@ def get_products(
         sort=sort.strip(),
         page=page,
         page_size=page_size,
+        prefer_sqlite=_process_running(),
     )
 
 
 @app.get("/api/products/options", dependencies=[Depends(_require_control)])
 def get_product_filter_options() -> dict[str, Any]:
-    return product_filter_options(DATABASE_PATH)
+    return product_filter_options(DATABASE_PATH, prefer_sqlite=_process_running())
 
 
 def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, Any]:
@@ -716,6 +788,16 @@ def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, An
 
     deleted_ids = [deleted["id"] for deleted in deleted_products]
     deleted_id_set = set(deleted_ids)
+
+    # The dashboard reads MySQL whenever it is configured, so a delete that
+    # only touched SQLite would leave the products visible and counted.
+    replica_error = None
+    if mysql_enabled():
+        try:
+            delete_products_mysql(deleted_ids)
+        except Exception as exc:
+            replica_error = str(exc)
+
     return {
         "deleted": True,
         "deleted_count": len(deleted_products),
@@ -730,6 +812,7 @@ def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, An
         "media_deleted": media_deleted,
         "media_error": media_error,
         "artifact_error": artifact_error,
+        "replica_error": replica_error,
         "catalog": artifact_summary["database_counts"],
         "historical_runs_preserved": True,
     }
@@ -741,15 +824,20 @@ def _remove_products(product_ids: list[str], delete_media: bool) -> dict[str, An
 def remove_products(request: BulkDeleteRequest) -> dict[str, Any]:
     """Delete up to 500 selected products with one durable checkpoint update."""
 
-    with state_lock:
-        if _process_running():
-            raise HTTPException(409, "Stop the active crawl before deleting products.")
+    with catalog_lock:
+        with state_lock:
+            if _process_running():
+                raise HTTPException(
+                    409, "Stop the active crawl before deleting products."
+                )
         return _remove_products(request.product_ids, request.delete_media)
 
 
 @app.get("/api/products/{product_id}", dependencies=[Depends(_require_control)])
 def get_product(product_id: str) -> dict[str, Any]:
-    value = product_detail(DATABASE_PATH, product_id)
+    value = product_detail(
+        DATABASE_PATH, product_id, prefer_sqlite=_process_running()
+    )
     if value is None:
         raise HTTPException(404, "Product not found.")
     return value
@@ -762,9 +850,12 @@ def remove_product(
 ) -> dict[str, Any]:
     """Delete one active product and durably replace mutable S3 artifacts."""
 
-    with state_lock:
-        if _process_running():
-            raise HTTPException(409, "Stop the active crawl before deleting products.")
+    with catalog_lock:
+        with state_lock:
+            if _process_running():
+                raise HTTPException(
+                    409, "Stop the active crawl before deleting products."
+                )
         result = _remove_products([product_id], delete_media)
     result["product_id"] = result["product_ids"][0]
     result["product_name"] = result["product_names"][0]
@@ -773,7 +864,11 @@ def remove_product(
 
 @app.get("/api/diagnostics", dependencies=[Depends(_require_control)])
 def get_diagnostics(limit: int = Query(default=100, ge=1, le=1000)):
-    return {"items": diagnostics(DATABASE_PATH, limit=limit)}
+    return {
+        "items": diagnostics(
+            DATABASE_PATH, limit=limit, prefer_sqlite=_process_running()
+        )
+    }
 
 
 @app.get("/api/runs", dependencies=[Depends(_require_control)])
@@ -821,12 +916,16 @@ def download() -> dict[str, str]:
 def download_master():
     """Build one current WooCommerce CSV from the restored SQLite checkpoint."""
 
-    with state_lock:
-        if _process_running():
-            raise HTTPException(
-                409,
-                "Wait for the active crawl to stop before building the master export.",
-            )
+    # Building the master CSV walks every product three times. Serialize it
+    # against other catalog mutations, but never behind ``state_lock`` -- that
+    # would stall the dashboard status poll for the whole export.
+    with catalog_lock:
+        with state_lock:
+            if _process_running():
+                raise HTTPException(
+                    409,
+                    "Wait for the active crawl to stop before building the master export.",
+                )
         if not DATABASE_PATH.exists():
             raise HTTPException(404, "No catalog checkpoint is available.")
 
