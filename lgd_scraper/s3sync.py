@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import tempfile
 import zipfile
@@ -123,6 +125,7 @@ def download_checkpoint(output_dir: Path, *, strict: bool = False) -> bool:
         return False
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate: Path | None = None
+    compressed_candidate: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             prefix=".catalog-checkpoint-",
@@ -131,11 +134,39 @@ def download_checkpoint(output_dir: Path, *, strict: bool = False) -> bool:
             delete=False,
         ) as temporary:
             candidate = Path(temporary.name)
-        s3_client().download_file(
-            os.environ["S3_BUCKET"],
-            _key("checkpoints", "catalog.sqlite"),
-            str(candidate),
-        )
+        with tempfile.NamedTemporaryFile(
+            prefix=".catalog-checkpoint-",
+            suffix=".sqlite.gz",
+            dir=output_dir,
+            delete=False,
+        ) as temporary:
+            compressed_candidate = Path(temporary.name)
+
+        client = s3_client()
+        try:
+            client.download_file(
+                os.environ["S3_BUCKET"],
+                _key("checkpoints", "catalog.sqlite.gz"),
+                str(compressed_candidate),
+            )
+        except Exception as compressed_error:
+            error_code = getattr(compressed_error, "response", {}).get(
+                "Error", {}
+            ).get("Code")
+            if error_code not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+            # Existing deployments wrote an uncompressed checkpoint. Retain a
+            # one-way compatibility path until the first compressed upload.
+            client.download_file(
+                os.environ["S3_BUCKET"],
+                _key("checkpoints", "catalog.sqlite"),
+                str(candidate),
+            )
+        else:
+            with gzip.open(compressed_candidate, "rb") as source, candidate.open(
+                "wb"
+            ) as destination:
+                shutil.copyfileobj(source, destination, length=1024 * 1024)
         connection = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
         try:
             result = connection.execute("PRAGMA quick_check").fetchone()
@@ -168,6 +199,8 @@ def download_checkpoint(output_dir: Path, *, strict: bool = False) -> bool:
     finally:
         if candidate is not None:
             candidate.unlink(missing_ok=True)
+        if compressed_candidate is not None:
+            compressed_candidate.unlink(missing_ok=True)
 
 
 def presigned_artifact_url(expires_in: int = 3600) -> str | None:
@@ -357,11 +390,19 @@ class S3ArtifactPipeline:
             snapshot = Path(temp_dir) / "catalog.sqlite"
             if not self._database_snapshot(snapshot):
                 return
+            compressed = Path(temp_dir) / "catalog.sqlite.gz"
+            compression_level = min(
+                9, max(1, int(os.getenv("S3_CHECKPOINT_COMPRESSION_LEVEL", "6")))
+            )
+            with snapshot.open("rb") as source, gzip.open(
+                compressed, "wb", compresslevel=compression_level
+            ) as destination:
+                shutil.copyfileobj(source, destination, length=1024 * 1024)
             s3_client().upload_file(
-                str(snapshot),
+                str(compressed),
                 self.bucket,
-                _key("checkpoints", "catalog.sqlite"),
-                ExtraArgs=_extra_args(),
+                _key("checkpoints", "catalog.sqlite.gz"),
+                ExtraArgs={**_extra_args(), "ContentType": "application/gzip"},
             )
 
     def _artifact_files(self) -> list[Path]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import sqlite3
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 from scrapy.http import HtmlResponse, Request
@@ -60,7 +61,7 @@ def test_store_api_product_name_decodes_html_entities():
     assert product["name"] == "Ali’i Ring"
 
 
-def test_loose_diamond_name_specs_become_attributes_without_dead_html_request():
+def test_loose_diamond_is_identified_without_inventing_attributes():
     spider = WooCommerceCatalogSpider(enrich_html=True)
 
     product = spider._normalize_product(
@@ -74,16 +75,17 @@ def test_loose_diamond_name_specs_become_attributes_without_dead_html_request():
     )
 
     assert product["product_family"] == "loose_diamond"
-    assert {
-        attribute["name"]: attribute["options"][0]
-        for attribute in product["attributes"]
-    } == {
-        "Shape": "Asscher",
-        "Carat": "0.91",
-        "Color": "D",
-        "Clarity": "VVS2",
-    }
+    assert product["categories"] == [
+        {
+            "id": "lab-grown-diamonds",
+            "name": "Lab Grown Diamonds",
+            "slug": "lab-grown-diamonds",
+            "assignment_source": "product_family:loose_diamond",
+        }
+    ]
+    assert product["attributes"] == []
     assert product["html_enrichment"]["status"] == "skipped"
+    assert product["html_enrichment"]["reason"] == "run_separate_catalog_enrichment"
     assert spider._should_enrich_product(product) is False
 
 
@@ -222,6 +224,117 @@ def test_product_page_extracts_variations_attributes_categories_and_images():
     ) == 2
 
 
+def test_live_inline_product_variations_preserve_wvg_gallery_and_dynamic_details():
+    inline_variations = [
+        {
+            "variation_id": 1016198,
+            "attributes": {"attribute_pa_metal": "14k-white-gold"},
+            "display_price": 990,
+            "display_regular_price": 1090,
+            "is_in_stock": True,
+            "image": {
+                "full_src": "https://cdn.example.test/white-front.jpg",
+                "alt": "White gold ring",
+            },
+            "wvg_images": [
+                {"src": "https://cdn.example.test/white-side.jpg", "alt": "Side"},
+                {"src": "https://cdn.example.test/white-hand.jpg", "alt": "Hand"},
+            ],
+            "section1data": [
+                "Metal: 14K White Gold",
+                "Setting Profile: Tulip Basket",
+                "Band Width: 1.80mm*",
+            ],
+        }
+    ]
+    structured = {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": "Lotus Heart Solitaire Engagement Ring",
+        "sku": "LGDHE-20",
+        "category": "Engagement Rings",
+    }
+    page = f"""
+    <html><head>
+      <script type="application/ld+json">{json.dumps(structured)}</script>
+    </head><body class="single-product postid-1016196">
+      <h1 class="product_title">Lotus Heart Solitaire Engagement Ring</h1>
+      <form class="variations_form custom-variations-form" data-product_id="1016196">
+        <label for="pa_metal">Metal</label>
+        <select id="pa_metal" name="attribute_pa_metal">
+          <option value="14k-white-gold">14K White Gold</option>
+        </select>
+      </form>
+      <script>var productVariations = {json.dumps(inline_variations)};</script>
+    </body></html>
+    """
+
+    spider = WooCommerceCatalogSpider()
+    items = list(
+        spider.parse_product_page(
+            response_for("https://example.test/product/lotus-heart/", page)
+        )
+    )
+    product = next(item for item in items if item.get("_record_type") == "product")
+    variation = product["variations"][0]
+
+    assert product["categories"][0]["name"] == "Engagement Rings"
+    assert product["html_enrichment"]["status"] == "complete"
+    assert variation["source"] == "html_inline_product_variations"
+    assert variation["attributes"] == {"metal": "14k-white-gold"}
+    assert [item["source_url"] for item in variation["gallery"]] == [
+        "https://cdn.example.test/white-side.jpg",
+        "https://cdn.example.test/white-hand.jpg",
+    ]
+    assert variation["details"]["setting_profile"]["value"] == "Tulip Basket"
+    assert variation["details"]["band_width"]["value"] == "1.80mm*"
+
+
+def test_live_diamond_grid_preserves_every_dynamic_field_and_description():
+    page = """
+    <html><body class="single-product postid-2301663">
+      <h1>1.96 Carat Marquise Cut Lab Grown Diamond</h1>
+      <div class="diamond-details-grid">
+        <div class="dd-item"><div class="dd-label">Carat</div><div class="dd-value fw-bold">1.96</div></div>
+        <div class="dd-item"><div class="dd-label">L x W x H</div><div class="dd-value fw-bold">4.05 x 12.49 x 6.50</div></div>
+        <div class="dd-item"><div class="dd-label">Cut</div><div class="dd-value"><div class="fw-bold">Ideal</div><div class="small">Maximum fire.</div></div></div>
+        <div class="dd-item"><div class="dd-label">Polished</div><div class="dd-value fw-bold">Excellent</div></div>
+        <div class="dd-item"><div class="dd-label">Future Source Field</div><div class="dd-value fw-bold">Dynamic value</div></div>
+      </div>
+    </body></html>
+    """
+    product = {
+        "_record_type": "product",
+        "id": "2301663",
+        "name": "Marquise Cut 1.96 Carat D Color IF Clarity Lab Grown Diamond",
+        "product_family": "loose_diamond",
+        "type": "simple",
+        "attributes": [],
+        "media": [],
+        "variations": [],
+    }
+
+    spider = WooCommerceCatalogSpider()
+    items = list(
+        spider.parse_product_page(
+            response_for("https://example.test/diamond/LGD14-12972/", page),
+            product,
+        )
+    )
+    completed = next(item for item in items if item.get("_record_type") == "product")
+    details = completed["diamond_details"]
+
+    assert details["carat"] == 1.96
+    assert details["polish"] == "Excellent"
+    assert details["size_mm"]["raw"] == "4.05 x 12.49 x 6.50"
+    assert details["fields"]["cut"] == {
+        "label": "Cut",
+        "value": "Ideal",
+        "description": "Maximum fire.",
+    }
+    assert details["fields"]["future_source_field"]["value"] == "Dynamic value"
+
+
 def test_sucuri_geo_block_detection():
     spider = WooCommerceCatalogSpider()
     response = response_for(
@@ -235,6 +348,38 @@ def test_sucuri_geo_block_detection():
     assert spider._is_blocked(response)
     spider._record_block(response)
     assert spider.access_blocked is True
+
+
+def test_sucuri_geo_block_stops_the_run_before_saved_products_are_rewritten():
+    closed = []
+    spider = WooCommerceCatalogSpider(enrichment_mode=True)
+    spider.crawler = SimpleNamespace(
+        engine=SimpleNamespace(
+            close_spider=lambda active_spider, reason: closed.append(
+                (active_spider, reason)
+            )
+        )
+    )
+    product = {
+        "_record_type": "product",
+        "id": "42",
+        "name": "Saved diamond",
+        "type": "simple",
+        "media": [],
+        "variations": [],
+    }
+    response = response_for(
+        "https://example.test/diamond/42/",
+        "<h1>Access Denied - Sucuri Website Firewall</h1>"
+        "<p>Block ID: GEO02</p>",
+        status=403,
+    )
+
+    emitted = list(spider.parse_product_page(response, product))
+
+    assert [item["_record_type"] for item in emitted] == ["diagnostic"]
+    assert spider.access_blocked is True
+    assert closed == [(spider, "access_blocked")]
 
 
 def test_sucuri_cookie_challenge_is_reported_as_blocked():
@@ -374,7 +519,77 @@ def test_checkpoint_resume_refreshes_legacy_diamonds_once(tmp_path):
 
     assert spider.refresh_product_ids == {"42"}
     assert len(products) == 1
-    assert products[0]["attributes"][0]["name"] == "Shape"
+    assert products[0]["product_family"] == "loose_diamond"
+    assert products[0]["attributes"] == []
+
+
+def test_enrichment_mode_updates_saved_ids_and_skips_current_schema(tmp_path):
+    database = tmp_path / "catalog.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE products (id TEXT PRIMARY KEY, raw_json TEXT)")
+    pending = {
+        "_record_type": "product",
+        "id": "42",
+        "name": "Pending diamond",
+        "url": "https://example.test/diamond/42/",
+        "product_family": "loose_diamond",
+        "type": "simple",
+        "media": [],
+        "variations": [],
+    }
+    current = {
+        **pending,
+        "id": "43",
+        "url": "https://example.test/diamond/43/",
+        "enrichment_schema_version": 1,
+    }
+    connection.executemany(
+        "INSERT INTO products VALUES (?, ?)",
+        [(item["id"], json.dumps(item)) for item in (pending, current)],
+    )
+    connection.commit()
+    connection.close()
+
+    spider = WooCommerceCatalogSpider(
+        output_dir=str(tmp_path),
+        resume_existing=True,
+        enrichment_mode=True,
+    )
+    requests = list(spider.start_requests())
+
+    assert spider.existing_product_ids == set()
+    assert [request.url for request in requests] == [pending["url"]]
+    assert spider.products_scheduled == 1
+    assert spider.products_already_enriched == 1
+    assert list(spider._emit_product(pending))[0]["id"] == "42"
+
+
+def test_successful_and_missing_pages_are_versioned_for_resumable_enrichment():
+    spider = WooCommerceCatalogSpider(enrichment_mode=True)
+    base = {
+        "_record_type": "product",
+        "id": "42",
+        "name": "Diamond",
+        "type": "simple",
+        "media": [],
+        "variations": [],
+    }
+
+    completed = list(
+        spider.parse_product_page(
+            response_for("https://example.test/diamond/42/", "<main><h1>Diamond</h1></main>"),
+            dict(base),
+        )
+    )[-1]
+    unavailable = list(
+        spider.parse_product_page(
+            response_for("https://example.test/diamond/43/", "Not found", status=404),
+            {**base, "id": "43"},
+        )
+    )[-1]
+
+    assert completed["enrichment_schema_version"] == 1
+    assert unavailable["enrichment_schema_version"] == 1
 
 
 def test_product_limit_does_not_close_taxonomy_requests_early():

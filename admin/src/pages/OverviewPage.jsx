@@ -24,9 +24,18 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
   const progress = limit ? Math.min(100, Math.round((currentProducts / limit) * 100)) : 0;
   const logLines = useMemo(() => (logs || "").split("\n").filter(Boolean).slice(-7).reverse(), [logs]);
   const quality = catalog.quality || {};
+  const enrichment = catalog.enrichment || {};
 
   function update(key, value) {
     setConfig((current) => ({ ...current, [key]: value }));
+  }
+
+  function updateMode(mode) {
+    setConfig((current) => ({
+      ...current,
+      mode,
+      resume_checkpoint: mode === "enrich" ? true : current.resume_checkpoint,
+    }));
   }
 
   return (
@@ -44,8 +53,8 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
         <div className="control-grid">
           <Field label="Source URL"><input value={activeConfig.base_url || ""} disabled={running} onChange={(event) => update("base_url", event.target.value)} /></Field>
           <Field label="Product limit" hint="0 means full catalog"><input type="number" min="0" value={activeConfig.mode === "full" ? 0 : activeConfig.max_products ?? 5} disabled={running || activeConfig.mode === "full"} onChange={(event) => update("max_products", Number(event.target.value))} /></Field>
-          <Field label="Mode"><select value={activeConfig.mode || "test"} disabled={running} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full WooCommerce catalog</option></select></Field>
-          <Field label="Resume from checkpoint"><select value={activeConfig.resume_checkpoint ? "yes" : "no"} disabled={running} onChange={(event) => update("resume_checkpoint", event.target.value === "yes")}><option value="yes">Latest checkpoint</option><option value="no">Start fresh</option></select></Field>
+          <Field label="Mode"><select value={activeConfig.mode || "test"} disabled={running} onChange={(event) => updateMode(event.target.value)}><option value="test">Test run</option><option value="full">Full WooCommerce catalog</option><option value="enrich">Enrich saved catalog</option></select></Field>
+          <Field label="Resume from checkpoint"><select value={activeConfig.resume_checkpoint ? "yes" : "no"} disabled={running || activeConfig.mode === "enrich"} onChange={(event) => update("resume_checkpoint", event.target.value === "yes")}><option value="yes">Latest checkpoint</option><option value="no">Start fresh</option></select></Field>
           <div className="run-state"><StatusMark state={status?.state || "idle"} /><small>{status?.message || "Ready to start."}</small><small>{status?.started_at ? `Started ${formatDate(status.started_at)}` : "No active run"}</small></div>
         </div>
         <div className="progress-row">
@@ -58,6 +67,15 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
 
       <section className="coverage-strip" aria-label="Catalog data coverage">
         {counters.map(([icon, key]) => <div className="coverage-item" key={key}><Icon name={icon} size={22} /><span><small>{key[0].toUpperCase() + key.slice(1)}</small><strong>{catalog[key] == null ? "—" : formatNumber(catalog[key])}</strong></span></div>)}
+      </section>
+
+      <section className="enrichment-strip" aria-label="Source-page enrichment coverage">
+        <div><small>Enrichment targets</small><strong>{formatNumber(enrichment.candidates)}</strong></div>
+        <div><small>Completed</small><strong>{formatNumber(enrichment.completed)}</strong></div>
+        <div><small>Remaining</small><strong>{formatNumber(enrichment.remaining)}</strong></div>
+        <div><small>Variations with galleries</small><strong>{formatNumber(enrichment.variations_with_gallery)}</strong></div>
+        <div><small>Variation gallery images</small><strong>{formatNumber(enrichment.variation_gallery_images)}</strong></div>
+        <div className={enrichment.media_missing_storage ? "metric-warning" : ""}><small>Media not stored</small><strong>{formatNumber(enrichment.media_missing_storage)}</strong></div>
       </section>
 
       <section className="panel panel--table">

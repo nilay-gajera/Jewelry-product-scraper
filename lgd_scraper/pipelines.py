@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import sqlite3
@@ -38,6 +39,12 @@ class CatalogS3FilesStore(S3FilesStore):
         extra = self._headers_to_botocore_kwargs(self.HEADERS)
         if headers:
             extra.update(self._headers_to_botocore_kwargs(headers))
+        content_type = mimetypes.guess_type(path)[0]
+        if content_type:
+            # Scrapy's default S3 headers only include Cache-Control. Explicit
+            # MIME metadata lets browsers and WordPress import the object as an
+            # image instead of serving every file as application/octet-stream.
+            extra.setdefault("ContentType", content_type)
         policy = str(self.POLICY or "").strip().lower()
         if policy not in {"", "none", "disabled"}:
             extra["ACL"] = self.POLICY
@@ -73,7 +80,10 @@ class CatalogMediaPipeline(FilesPipeline):
         seen: set[str] = set()
         for media in item.get("media", []):
             url = media.get("source_url")
-            if not url or url in seen:
+            # Enrichment reuses the saved product object. Existing S3 paths are
+            # already authoritative, so only newly discovered gallery assets
+            # need to be transferred again.
+            if not url or url in seen or media.get("local_path"):
                 continue
             seen.add(url)
             yield Request(
@@ -97,8 +107,16 @@ class CatalogMediaPipeline(FilesPipeline):
 
     def item_completed(self, results, item, info):
         by_url: dict[str, dict[str, Any]] = {}
+        failures: list[dict[str, str]] = []
         for ok, result in results:
             if not ok:
+                request = getattr(result, "request", None)
+                failures.append(
+                    {
+                        "url": str(getattr(request, "url", "") or ""),
+                        "error": str(getattr(result, "value", result)),
+                    }
+                )
                 continue
             by_url[result["url"]] = {
                 "local_path": result.get("path"),
@@ -108,6 +126,8 @@ class CatalogMediaPipeline(FilesPipeline):
 
         for media in item.get("media", []):
             media.update(by_url.get(media.get("source_url", ""), {}))
+        if failures:
+            item["media_download_failures"] = failures
         return item
 
 
@@ -257,6 +277,34 @@ class CatalogWriterPipeline:
         if record_type == "product":
             self._write_jsonl("products", item)
             self._store_product(item)
+            media_failures = item.get("media_download_failures") or []
+            if media_failures:
+                diagnostic = {
+                    "_record_type": "diagnostic",
+                    "kind": "media_download_failed",
+                    "url": item.get("url"),
+                    "status": None,
+                    "message": (
+                        f"{len(media_failures)} media file(s) could not be stored: "
+                        + ", ".join(
+                            str(failure.get("url") or "unknown")
+                            for failure in media_failures[:10]
+                        )
+                    ),
+                    "product_id": item.get("id"),
+                    "failures": media_failures,
+                }
+                key = (
+                    diagnostic["kind"],
+                    diagnostic["url"],
+                    diagnostic["status"],
+                    diagnostic["message"],
+                )
+                if key not in self.diagnostics_seen:
+                    self.diagnostics_seen.add(key)
+                    self.counts["diagnostic"] += 1
+                    self._write_jsonl("diagnostics", diagnostic)
+                    self._store_diagnostic(diagnostic)
         elif record_type == "category":
             self._write_jsonl("categories", item)
             self._store_category(item)
@@ -278,6 +326,9 @@ class CatalogWriterPipeline:
             "state": "running",
             "records_seen": dict(self.counts),
             "products_scheduled": getattr(self.crawler.spider, "products_scheduled", 0),
+            "products_already_enriched": getattr(
+                self.crawler.spider, "products_already_enriched", 0
+            ),
             "current_product": (
                 {
                     "id": item.get("id"),
@@ -570,6 +621,12 @@ class CatalogWriterPipeline:
             "access_blocked": bool(getattr(spider, "access_blocked", False)),
             "block_reason": getattr(spider, "block_reason", None),
             "woocommerce_export": self.woocommerce_counts,
+            "enrichment_run": {
+                "schema_version": getattr(spider, "ENRICHMENT_SCHEMA_VERSION", None),
+                "scheduled": getattr(spider, "products_scheduled", 0),
+                "updated": getattr(spider, "products_emitted", 0),
+                "already_current": getattr(spider, "products_already_enriched", 0),
+            },
         }
         (self.output_dir / "crawl-summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"

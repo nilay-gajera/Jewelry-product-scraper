@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import sqlite3
 from pathlib import Path
 
@@ -22,6 +23,21 @@ class DownloadS3Client:
         self.payload = payload
 
     def download_file(self, bucket, key, filename):
+        if key.endswith(".gz"):
+            Path(filename).write_bytes(gzip.compress(self.payload))
+        else:
+            Path(filename).write_bytes(self.payload)
+
+
+class LegacyDownloadS3Client:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def download_file(self, bucket, key, filename):
+        if key.endswith(".gz"):
+            error = RuntimeError("not found")
+            error.response = {"Error": {"Code": "404"}}
+            raise error
         Path(filename).write_bytes(self.payload)
 
 
@@ -46,12 +62,22 @@ def test_uploads_checkpoint_final_archive_and_manifest(tmp_path, monkeypatch):
     pipeline._upload_final_artifacts()
 
     keys = [key for _, key, _ in fake.uploads]
-    assert "exports/jewelry/checkpoints/catalog.sqlite" in keys
+    assert "exports/jewelry/checkpoints/catalog.sqlite.gz" in keys
     assert "exports/jewelry/latest/catalog.sqlite" in keys
     assert "exports/jewelry/latest/woocommerce-master.csv" in keys
     assert "exports/jewelry/latest/catalog-export.zip" in keys
     assert "exports/jewelry/latest/s3-upload.json" in keys
     assert (tmp_path / "s3-upload.json").exists()
+    compressed_payload = next(
+        payload
+        for _, key, payload in fake.uploads
+        if key == "exports/jewelry/checkpoints/catalog.sqlite.gz"
+    )
+    restored = tmp_path / "checkpoint-restored.sqlite"
+    restored.write_bytes(gzip.decompress(compressed_payload))
+    restored_database = sqlite3.connect(restored)
+    assert restored_database.execute("SELECT id FROM products").fetchone()[0] == "99"
+    restored_database.close()
 
 
 def test_large_catalog_checkpoint_interval_defaults_to_one_hundred(monkeypatch):
@@ -146,6 +172,25 @@ def test_checkpoint_restore_validates_then_atomically_replaces_database(
     assert not (output / "catalog.sqlite-wal").exists()
     assert not (output / "catalog.sqlite-shm").exists()
     assert not list(output.glob(".catalog-checkpoint-*.sqlite"))
+
+
+def test_checkpoint_restore_accepts_legacy_uncompressed_object(tmp_path, monkeypatch):
+    source = tmp_path / "source.sqlite"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE products (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO products VALUES ('legacy')")
+    connection.commit()
+    connection.close()
+    monkeypatch.setenv("S3_BUCKET", "catalog-bucket")
+    monkeypatch.setattr(
+        s3sync, "s3_client", lambda: LegacyDownloadS3Client(source.read_bytes())
+    )
+
+    assert s3sync.download_checkpoint(tmp_path / "restored") is True
+
+    restored = sqlite3.connect(tmp_path / "restored" / "catalog.sqlite")
+    assert restored.execute("SELECT id FROM products").fetchone()[0] == "legacy"
+    restored.close()
 
 
 def test_invalid_checkpoint_never_damages_existing_database(tmp_path, monkeypatch):

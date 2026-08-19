@@ -38,10 +38,10 @@ rendered on public pages.
 scrapy crawl catalog
 ```
 
-The spider first requests the unauthenticated WooCommerce Store API. It enriches
-each result from the product page, including embedded WooCommerce variation JSON
-and the product gallery. If the Store API is unavailable, it falls back to the
-site's product sitemap.
+The spider first requests the unauthenticated WooCommerce Store API. Jewelry
+pages are enriched from the source page, including the site's inline
+`productVariations` payload. That payload contains the exact metal variation,
+featured image, `wvg_images` gallery, and dynamically named setting details.
 
 Public mode can retrieve only published storefront data. It cannot guarantee
 draft/private products or admin-only plugin metadata.
@@ -51,6 +51,20 @@ For custom themes and gallery plugins, the parser also reads Store API
 JSON, JSON-LD `ProductGroup` variants, structured prices/availability, and
 custom-theme product description/SKU selectors. WooCommerce API variations stay
 authoritative; structured variants are used only when that lookup fails.
+
+Loose diamonds intentionally use a second checkpoint-enrichment pass. The fast
+catalog pass stores every product first; enrichment then reads each saved diamond
+page and captures every `.diamond-details-grid .dd-item` label, value, and optional
+description. Unknown future labels are retained automatically and become dynamic
+WooCommerce `meta:_diamond_*` columns instead of being discarded.
+
+The Store API leaves individual loose-diamond category assignments empty even
+though WooCommerce reports them under its generic Uncategorized bucket. Records
+explicitly identified as `product_family=loose_diamond` are therefore assigned to
+`Lab Grown Diamonds`; the assignment source is retained in dynamic metadata.
+Variation attributes otherwise remain source-authoritative. Invalid placeholder
+pairs such as `Ring Size = Ring Size` and `Back Setting = Back Setting` are omitted
+from variation rows because they carry no selectable source value.
 
 ## Installation
 
@@ -80,9 +94,10 @@ control panel.
 
 Render Free has an ephemeral filesystem and can stop an idle service. Keep the
 control page open while a crawl runs. The page polls live status as a normal
-user-facing operation, and S3 checkpoints preserve the normalized database every
-100 products by default. On a restart or deploy, the service automatically restores the
-latest S3 checkpoint before serving the admin API. If a crawl is active during a
+user-facing operation. Compressed S3 checkpoints preserve the normalized database
+every 100 catalog products and every 500 enrichment updates by default. On a restart
+or deploy, the service automatically restores the latest compressed checkpoint (or
+the legacy uncompressed checkpoint) before serving the admin API. If a crawl is active during a
 deploy, the service asks Scrapy to close cleanly so its final database is uploaded.
 
 The Render container deliberately uses static HTTP/API extraction and does not
@@ -148,11 +163,45 @@ active.
 
 ## Safe first run
 
+For the local admin app, copy `.env.local.example` to `.env.local`, insert a
+newly rotated AWS key/secret, then double-click `run-local.command`. The secrets
+file is ignored by Git. The launcher prints a strong control token and keeps the
+service bound to `127.0.0.1`.
+
 Start with five products:
 
 ```bash
 scrapy crawl catalog -a max_products=5
 ```
+
+After the catalog checkpoint exists, test enrichment on five saved diamonds or
+variable jewelry products:
+
+```bash
+SCRAPER_JOBDIR=work/jobs/enrichment-test \
+scrapy crawl catalog \
+  -a output_dir=outputs/catalog \
+  -a enrichment_mode=true \
+  -a max_products=5
+```
+
+Then run the complete saved catalog enrichment:
+
+```bash
+SCRAPER_JOBDIR=work/jobs/enrichment-full \
+scrapy crawl catalog \
+  -a output_dir=outputs/catalog \
+  -a enrichment_mode=true
+```
+
+In the admin panel, the equivalent choice is **Enrich saved catalog** with
+**Resume from checkpoint** enabled. This mode updates products in place, downloads
+only newly discovered gallery media, rebuilds the one master CSV, and writes the
+updated checkpoint back to S3.
+
+A Chrome VPN extension applies only to Chrome tabs. The background Scrapy process
+must be on a system-wide VPN or use `SCRAPER_PROXY_URL` when the source blocks the
+machine or server IP.
 
 Enable JavaScript rendering only if the static page does not expose variation
 data:
@@ -222,6 +271,45 @@ original site. Every metadata key discovered on a product or variation becomes
 a dynamic `meta:<key>` column, including newly encountered keys and structured
 values. Always test a small import on a staging store before importing the full
 catalog.
+
+#### Fast local import with remote S3 media
+
+For large local imports, install
+`wordpress/mu-plugins/lgd-fast-catalog-import.php` in the destination site's
+`wp-content/mu-plugins/` directory before starting WooCommerce's Product CSV
+Importer. The must-use plugin increases the importer batch size to 200 and
+creates lightweight WordPress attachment records that point directly to the
+public S3 URLs. It does not download or resize the catalog images locally.
+
+Keep the plugin active while importing and while the store uses those remote
+attachments. This workflow requires every URL in the CSV `Images` column to be
+publicly readable.
+
+### Build the master CSV locally
+
+Render is not required when the durable S3 checkpoint exists. Either configure
+AWS credentials and download the checkpoint automatically:
+
+```bash
+S3_BUCKET=your-bucket \
+S3_PREFIX=jewelry-product-scraper \
+AWS_REGION=us-west-1 \
+S3_PUBLIC_BASE_URL=https://your-public-media-base \
+python -m lgd_scraper.local_export
+```
+
+Or download `checkpoints/catalog.sqlite` in the AWS Console and build from that
+file without any AWS credentials:
+
+```bash
+python -m lgd_scraper.local_export \
+  --database /path/to/catalog.sqlite \
+  --public-base-url https://your-public-media-base
+```
+
+Both paths validate the SQLite checkpoint, generate only
+`outputs/local-woocommerce-export/woocommerce-master.csv`, and run the strict
+WooCommerce preflight before reporting success.
 
 ### S3 object layout
 

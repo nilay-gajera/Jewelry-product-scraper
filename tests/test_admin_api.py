@@ -476,6 +476,25 @@ def test_process_watcher_finishes_with_warning_when_local_archive_fails(
     assert "disk full" in state["message"]
 
 
+def test_enrichment_uses_the_large_catalog_checkpoint_interval(monkeypatch):
+    monkeypatch.setenv("S3_UPLOAD_EVERY", "100")
+    monkeypatch.delenv("S3_ENRICH_UPLOAD_EVERY", raising=False)
+    config = {
+        "mode": "enrich",
+        "concurrency": 2,
+        "download_delay": 1.0,
+        "download_timeout": 45,
+        "retry_times": 3,
+        "download_media": True,
+        "obey_robots": True,
+    }
+
+    environment = service._configure_crawl_environment(config, "run-1")
+
+    assert environment["S3_UPLOAD_EVERY"] == "500"
+    assert environment["SCRAPER_USE_PLAYWRIGHT"] == "0"
+
+
 def test_product_deletion_uses_a_copy_and_removes_related_records(tmp_path):
     source = tmp_path / "source.sqlite"
     candidate = tmp_path / "candidate.sqlite"

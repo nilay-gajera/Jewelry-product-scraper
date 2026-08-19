@@ -20,6 +20,10 @@ services:
         value: none
       - key: S3_UPLOAD_EVERY
         value: "100"
+      - key: S3_ENRICH_UPLOAD_EVERY
+        value: "500"
+      - key: S3_CHECKPOINT_COMPRESSION_LEVEL
+        value: "6"
       - key: S3_RESTORE_CHECKPOINT
         value: "1"
       - key: S3_SERVER_SIDE_ENCRYPTION

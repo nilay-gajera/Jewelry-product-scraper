@@ -40,16 +40,17 @@ export function RunsPage({ status, settings, logs, onStart, onStop, onError }) {
   const selectedCount = (discovery.categories || []).reduce((total, category) => total + (selectedIds.has(category.id) ? Number(category.count || 0) : 0), 0);
 
   return <main className="page">
-    <header className="page-header"><div><h1>Crawl runs</h1><p>Configure, resume, and audit full or test catalog runs.</p></div><Button icon="play" tone="primary" disabled={active} onClick={() => onStart(config)}>Start new crawl</Button></header>
+    <header className="page-header"><div><h1>Crawl runs</h1><p>Build the catalog, then enrich its saved products with full page details and variation galleries.</p></div><Button icon="play" tone="primary" disabled={active} onClick={() => onStart(config)}>Start new crawl</Button></header>
     <section className="run-config panel">
       <div className="run-config__grid">
         <Field label="Source URL"><input disabled={active} value={displayedConfig.base_url || ""} onChange={(event) => update("base_url", event.target.value)} /></Field>
-        <Field label="Crawl mode"><select disabled={active} value={displayedConfig.mode || "test"} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full WooCommerce catalog</option></select></Field>
+        <Field label="Crawl mode"><select disabled={active} value={displayedConfig.mode || "test"} onChange={(event) => update("mode", event.target.value)}><option value="test">Test run</option><option value="full">Full WooCommerce catalog</option><option value="enrich">Enrich saved catalog</option></select></Field>
         <Field label="Product limit" hint="0 means no limit"><input type="number" min="0" disabled={active || displayedConfig.mode === "full"} value={displayedConfig.mode === "full" ? 0 : displayedConfig.max_products ?? 5} onChange={(event) => update("max_products", Number(event.target.value))} /></Field>
         <Field label="Concurrency"><input disabled={active} type="number" min="1" max="16" value={displayedConfig.concurrency ?? 2} onChange={(event) => update("concurrency", Number(event.target.value))} /></Field>
         <Field label="Download delay (seconds)"><input disabled={active} type="number" min="0.1" step="0.1" value={displayedConfig.download_delay ?? 1} onChange={(event) => update("download_delay", Number(event.target.value))} /></Field>
         <Field label="Request timeout"><input disabled={active} type="number" min="5" value={displayedConfig.download_timeout ?? 45} onChange={(event) => update("download_timeout", Number(event.target.value))} /></Field>
       </div>
+      {displayedConfig.mode === "enrich" ? <div className="security-notice"><Icon name="check" /><span><strong>Checkpoint enrichment.</strong> Reads the existing S3 catalog, adds dynamic diamond specifications and complete per-metal galleries, then updates the same master export. Keep Resume from checkpoint enabled.</span></div> : null}
       <div className="toggle-row">
         {["obey_robots", "enrich_html", "download_media", "resume_checkpoint"].map((key) => <label key={key}><input disabled={active} type="checkbox" checked={Boolean(displayedConfig[key])} onChange={(event) => update(key, event.target.checked)} /><span>{key.split("_").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ")}</span></label>)}
       </div>

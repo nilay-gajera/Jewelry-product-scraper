@@ -202,6 +202,20 @@ def catalog_summary(database_path: Path) -> dict[str, Any]:
             "missing_attributes": 0,
             "missing_variations": 0,
         },
+        "enrichment": {
+            "schema_version": 1,
+            "candidates": 0,
+            "completed": 0,
+            "remaining": 0,
+            "diamonds": 0,
+            "diamonds_completed": 0,
+            "variable_products": 0,
+            "variable_products_completed": 0,
+            "variations_with_gallery": 0,
+            "variation_gallery_images": 0,
+            "media_missing_storage": 0,
+            "products_with_media_failures": 0,
+        },
     }
     if connection is None:
         return empty
@@ -224,6 +238,91 @@ def catalog_summary(database_path: Path) -> dict[str, Any]:
                 empty[key] = connection.execute(
                     f"SELECT COUNT(*) FROM {table}"
                 ).fetchone()[0]
+
+        if "products" in table_names:
+            enrichment_row = connection.execute(
+                """
+                WITH catalog AS (
+                    SELECT
+                        product_type,
+                        CASE WHEN json_valid(raw_json)
+                            THEN json_extract(raw_json, '$.product_family') END AS family,
+                        COALESCE(CASE WHEN json_valid(raw_json)
+                            THEN json_extract(raw_json, '$.enrichment_schema_version') END, 0)
+                            AS schema_version,
+                        COALESCE(CASE WHEN json_valid(raw_json)
+                            THEN json_array_length(raw_json, '$.variations') END, 0)
+                            AS embedded_variations,
+                        COALESCE(CASE WHEN json_valid(raw_json)
+                            THEN json_array_length(raw_json, '$.media_download_failures') END, 0)
+                            AS media_failures
+                    FROM products
+                ), candidates AS (
+                    SELECT *,
+                        (family = 'loose_diamond' OR product_type = 'variable'
+                         OR embedded_variations > 0) AS is_candidate
+                    FROM catalog
+                )
+                SELECT
+                    COALESCE(SUM(is_candidate), 0),
+                    COALESCE(SUM(is_candidate AND schema_version >= 1), 0),
+                    COALESCE(SUM(family = 'loose_diamond'), 0),
+                    COALESCE(SUM(family = 'loose_diamond' AND schema_version >= 1), 0),
+                    COALESCE(SUM(product_type = 'variable'), 0),
+                    COALESCE(SUM(product_type = 'variable' AND schema_version >= 1), 0),
+                    COALESCE(SUM(media_failures > 0), 0)
+                FROM candidates
+                """
+            ).fetchone()
+            enrichment = empty["enrichment"]
+            (
+                enrichment["candidates"],
+                enrichment["completed"],
+                enrichment["diamonds"],
+                enrichment["diamonds_completed"],
+                enrichment["variable_products"],
+                enrichment["variable_products_completed"],
+                enrichment["products_with_media_failures"],
+            ) = tuple(enrichment_row)
+            enrichment["remaining"] = max(
+                0, enrichment["candidates"] - enrichment["completed"]
+            )
+
+        variation_columns = (
+            {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(variations)").fetchall()
+            }
+            if "variations" in table_names
+            else set()
+        )
+        if "raw_json" in variation_columns:
+            empty["enrichment"]["variations_with_gallery"] = connection.execute(
+                """
+                SELECT COUNT(*) FROM variations
+                WHERE json_valid(raw_json)
+                  AND COALESCE(json_array_length(raw_json, '$.gallery'), 0) > 0
+                """
+            ).fetchone()[0]
+        image_columns = (
+            {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(images)").fetchall()
+            }
+            if "images" in table_names
+            else set()
+        )
+        if {"role", "local_path"}.issubset(image_columns):
+            media_row = connection.execute(
+                """
+                SELECT
+                    COALESCE(SUM(role = 'variation_gallery'), 0),
+                    COALESCE(SUM(local_path IS NULL OR TRIM(local_path) = ''), 0)
+                FROM images
+                """
+            ).fetchone()
+            empty["enrichment"]["variation_gallery_images"] = media_row[0]
+            empty["enrichment"]["media_missing_storage"] = media_row[1]
 
         relationship_tables = {
             "images",

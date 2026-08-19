@@ -18,6 +18,9 @@ dev = [
   "pytest>=8,<10",
 ]
 
+[project.scripts]
+lgd-export-woocommerce = "lgd_scraper.local_export:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

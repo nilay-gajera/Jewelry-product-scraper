@@ -16,6 +16,8 @@ from scrapy import Request
 from scrapy.http import Response
 from scrapy_playwright.page import PageMethod
 
+from lgd_scraper.catalog_rules import assign_loose_diamond_category
+
 
 def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -33,6 +35,11 @@ def _clean_html(value: Any) -> str:
 
 class WooCommerceCatalogSpider(scrapy.Spider):
     name = "catalog"
+
+    # Bump this whenever the source-page enrichment contract changes. Saved
+    # products with an older version are scheduled again, while completed
+    # products are skipped after a restart instead of wasting another request.
+    ENRICHMENT_SCHEMA_VERSION = 1
 
     custom_settings = {
         "HTTPERROR_ALLOW_ALL": True,
@@ -83,13 +90,20 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         self.allowed_domains = [urlparse(self.base_url).hostname or ""]
         self.resume_existing = _truthy(resume_existing)
         self.enrichment_mode = _truthy(enrichment_mode)
-        (
-            self.existing_product_ids,
-            self.refresh_product_ids,
-        ) = self._load_existing_product_ids()
+        if self.enrichment_mode:
+            # Enrichment is an authoritative update of saved records. Loading
+            # these IDs would make the final emission gate discard every
+            # product that this mode is specifically intended to update.
+            self.existing_product_ids, self.refresh_product_ids = set(), set()
+        else:
+            (
+                self.existing_product_ids,
+                self.refresh_product_ids,
+            ) = self._load_existing_product_ids()
 
         self.products_scheduled = 0
         self.products_emitted = 0
+        self.products_already_enriched = 0
         self.fallback_started = False
         self.second_sitemap_attempted = False
         self.access_blocked = False
@@ -245,6 +259,9 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                         or product.get("variations")
                     ):
                         continue
+                    if not self._needs_enrichment(product):
+                        self.products_already_enriched += 1
+                        continue
                     product["_record_type"] = "product"
                     self.products_scheduled += 1
                     yield self._page_request(str(product["url"]), product)
@@ -259,6 +276,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 "message": f"The existing catalog could not be read: {exc}",
             }
             return
+
+    def _needs_enrichment(self, product: dict[str, Any]) -> bool:
+        try:
+            saved_version = int(product.get("enrichment_schema_version") or 0)
+        except (TypeError, ValueError):
+            saved_version = 0
+        return saved_version < self.ENRICHMENT_SCHEMA_VERSION
 
 
     def parse_products_api(self, response: Response):
@@ -459,6 +483,10 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 "status": "unavailable",
                 "http_status": 404,
             }
+            # A real 404 is a completed enrichment attempt for this schema.
+            # Do not request the same permanently unavailable page on every
+            # resumed run; the stored API record remains exportable.
+            product["enrichment_schema_version"] = self.ENRICHMENT_SCHEMA_VERSION
             if (
                 not self.authenticated
                 and product.get("type") == "variable"
@@ -471,12 +499,18 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 yield from self._emit_product(product)
             return
         if response.status != 200 or self._is_blocked(response):
+            blocked = self._is_blocked(response)
             self._record_block(response)
             yield self._diagnostic_for_response(
                 response,
                 "product_page_unavailable",
                 f"Product page could not be read (HTTP {response.status}).",
             )
+            if blocked:
+                # A geographic/firewall denial applies to the whole run. Keep
+                # the saved product unchanged and stop before scheduling tens
+                # of thousands of requests that cannot succeed.
+                return
             if (
                 not self.authenticated
                 and product.get("type") == "variable"
@@ -548,26 +582,64 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         self._merge_html_attributes(product, response)
         self._merge_html_media(product, response)
         self._merge_diamond_details(product, response)
+        if product.get("product_family") == "loose_diamond" and not (
+            (product.get("diamond_details") or {}).get("fields")
+        ):
+            yield {
+                "_record_type": "diagnostic",
+                "kind": "diamond_details_missing",
+                "url": response.url,
+                "status": response.status,
+                "message": "The product page loaded but contained no diamond-details grid.",
+            }
+        product["html_enrichment"] = {
+            "status": "complete",
+            "http_status": response.status,
+            "source_url": response.url,
+        }
+        product["enrichment_schema_version"] = self.ENRICHMENT_SCHEMA_VERSION
 
-        embedded = response.css("[data-product_variations]::attr(data-product_variations)").get()
-        if embedded and embedded.strip() not in {"", "false"}:
-            try:
-                variations = json.loads(html.unescape(embedded))
-            except json.JSONDecodeError:
-                variations = []
+        variations, variation_source, variation_error = self._embedded_product_variations(
+            response
+        )
+        if variation_error:
+            yield {
+                "_record_type": "diagnostic",
+                "kind": "variation_json_invalid",
+                "url": response.url,
+                "status": response.status,
+                "message": variation_error,
+            }
+        if variations:
+            product["type"] = "variable"
+            product["variations"] = [
+                self._normalize_variation(item, product["name"], variation_source)
+                for item in variations
+            ]
+            missing_gallery_ids = [
+                str(variation.get("id") or "unknown")
+                for variation in product["variations"]
+                if not variation.get("gallery")
+            ]
+            if missing_gallery_ids:
                 yield {
                     "_record_type": "diagnostic",
-                    "kind": "variation_json_invalid",
+                    "kind": "variation_gallery_missing",
                     "url": response.url,
                     "status": response.status,
-                    "message": "Embedded WooCommerce variation JSON was not valid JSON.",
+                    "message": (
+                        f"{len(missing_gallery_ids)} inline variation(s) had no gallery: "
+                        + ", ".join(missing_gallery_ids[:20])
+                    ),
                 }
-            if variations:
-                product["type"] = "variable"
-                product["variations"] = [
-                    self._normalize_variation(item, product["name"], "html")
-                    for item in variations
-                ]
+        elif response.css("form.variations_form"):
+            yield {
+                "_record_type": "diagnostic",
+                "kind": "inline_variations_missing",
+                "url": response.url,
+                "status": response.status,
+                "message": "A variation form was present but no authoritative inline variation payload was found.",
+            }
 
         if (
             self.authenticated
@@ -590,6 +662,49 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             yield from self._finish_product(product)
         else:
             yield from self._emit_product(product)
+
+    @staticmethod
+    def _embedded_product_variations(
+        response: Response,
+    ) -> tuple[list[dict[str, Any]], str, str | None]:
+        """Read authoritative Woo variation JSON from attributes or inline JS."""
+
+        embedded = response.css(
+            "[data-product_variations]::attr(data-product_variations)"
+        ).get()
+        if embedded and embedded.strip() not in {"", "false"}:
+            try:
+                value = json.loads(html.unescape(embedded))
+            except (json.JSONDecodeError, TypeError) as exc:
+                return [], "html_data_attribute", (
+                    f"The data-product_variations payload was invalid JSON: {exc}"
+                )
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)], (
+                    "html_data_attribute"
+                ), None
+
+        decoder = json.JSONDecoder()
+        assignment = re.compile(
+            r"\b(?:var|let|const)\s+(?:productVariations|product_variations)\s*=\s*"
+        )
+        for script in response.css("script:not([src])::text").getall():
+            match = assignment.search(script)
+            if not match:
+                continue
+            try:
+                value, _ = decoder.raw_decode(
+                    html.unescape(script[match.end() :]).lstrip()
+                )
+            except (json.JSONDecodeError, TypeError) as exc:
+                return [], "html_inline_product_variations", (
+                    f"The inline productVariations payload was invalid JSON: {exc}"
+                )
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)], (
+                    "html_inline_product_variations"
+                ), None
+        return [], "html", None
 
     def parse_categories_api(self, response: Response):
         payload = self._json_list(response)
@@ -838,7 +953,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "meta_data": raw.get("meta_data") or [],
             "raw_api": raw,
         }
-        self._infer_diamond_attributes(product)
+        self._identify_diamond_product(product)
         for position, image in enumerate(images):
             url = (
                 image.get("src")
@@ -861,35 +976,17 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             )
         return product
 
-    def _infer_diamond_attributes(self, product: dict[str, Any]) -> None:
-        """Preserve diamond specs encoded by the source in otherwise-empty names."""
+    def _identify_diamond_product(self, product: dict[str, Any]) -> None:
+        """Identify source diamond records without inventing catalog attributes."""
 
-        if product.get("attributes"):
-            return
         match = self.DIAMOND_NAME_RE.match(str(product.get("name") or "").strip())
         if not match:
             return
-        values = {
-            "Shape": match.group("shape").strip().title(),
-            "Carat": match.group("carat"),
-            "Color": match.group("color").upper(),
-            "Clarity": match.group("clarity").upper(),
-        }
         product["product_family"] = "loose_diamond"
-        product["attributes"] = [
-            {
-                "id": f"inferred_{name.lower()}",
-                "name": name,
-                "visible": True,
-                "variation": False,
-                "options": [value],
-                "source": "inferred_from_product_name",
-            }
-            for name, value in values.items()
-        ]
+        assign_loose_diamond_category(product)
         product["html_enrichment"] = {
             "status": "skipped",
-            "reason": "store_api_loose_diamond_record",
+            "reason": "run_separate_catalog_enrichment",
         }
 
     @staticmethod
@@ -916,6 +1013,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         label_aliases = {
             "carat": "carat",
             "carat weight": "carat",
+            "l x w x h": "size_mm",
             "size mm": "size_mm",
             "measurements": "size_mm",
             "measurement": "size_mm",
@@ -941,6 +1039,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "fluorescence": "fluorescence",
             "fluorescence intensity": "fluorescence",
             "polish": "polish",
+            "polished": "polish",
             "symmetry": "symmetry",
             "culet": "culet",
             "table": "table_percent",
@@ -952,76 +1051,51 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "certificate lab": "certificate_lab",
             "lab": "certificate_lab",
         }
-        section_labels = {
-            "diamond details",
-            "additional details",
-            "diamond detail",
-            "additional detail",
-        }
         values: dict[str, Any] = {}
-
-        def add_value(raw_key: Any, raw_value: Any) -> None:
-            key = label_aliases.get(self._diamond_label(raw_key))
-            if not key or raw_value in (None, "", [], {}):
-                return
-            if isinstance(raw_value, (dict, list)):
-                return
-            text_value = _clean_html(raw_value).strip() or str(raw_value).strip()
-            if not text_value or self._diamond_label(text_value) in section_labels:
-                return
-            values.setdefault(key, text_value)
-
-        def scan_payload(value: Any, depth: int = 0) -> None:
-            if depth > 8:
-                return
-            if isinstance(value, dict):
-                for raw_key, nested in value.items():
-                    add_value(raw_key, nested)
-                    scan_payload(nested, depth + 1)
-            elif isinstance(value, list):
-                for nested in value[:500]:
-                    scan_payload(nested, depth + 1)
-
-        for script_value in response.css(
-            'script[type="application/json"]::text, '
-            'script[id*="next" i]::text, script[id*="nuxt" i]::text'
-        ).getall():
-            try:
-                scan_payload(json.loads(script_value))
-            except (json.JSONDecodeError, TypeError):
+        fields: dict[str, dict[str, str]] = {}
+        for item in response.css(".diamond-details-grid .dd-item"):
+            label = _text(item.css(".dd-label *::text, .dd-label::text").getall())
+            value_node = item.css(".dd-value")
+            if not label or not value_node:
                 continue
-
-        text_values = [
-            _text([value])
-            for value in response.xpath(
-                "//body//text()[not(ancestor::script) and not(ancestor::style)]"
-            ).getall()
-            if _text([value])
-        ]
-        for index, label_text in enumerate(text_values):
-            normalized_label = self._diamond_label(label_text)
-            key = label_aliases.get(normalized_label)
-            if not key or key in values:
+            description = _text(value_node.css(".small *::text, .small::text").getall())
+            primary = _text(
+                value_node.css(".fw-bold *::text, .fw-bold::text").getall()
+            )
+            if not primary:
+                primary = _text(
+                    value_node.xpath(
+                        ".//text()[not(ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' small ')])]"
+                    ).getall()
+                )
+            if not primary:
                 continue
-            for candidate in text_values[index + 1 : index + 9]:
-                normalized_candidate = self._diamond_label(candidate)
-                if not normalized_candidate or normalized_candidate in section_labels:
-                    continue
-                if normalized_candidate in label_aliases:
-                    break
-                add_value(label_text, candidate)
-                break
+            field_key = re.sub(
+                r"[^a-z0-9]+", "_", self._diamond_label(label)
+            ).strip("_")
+            if not field_key:
+                continue
+            field = {"label": label, "value": primary}
+            if description:
+                field["description"] = description
+            fields[field_key] = field
+            canonical_key = label_aliases.get(self._diamond_label(label))
+            if canonical_key:
+                values.setdefault(canonical_key, primary)
 
-        if not values:
+        if not fields:
             return
 
         details = dict(product.get("diamond_details") or {})
         raw_values = dict(details.get("raw_values") or {})
-        raw_values.update(values)
+        raw_values.update(
+            {field["label"]: field["value"] for field in fields.values()}
+        )
         details.update(
             {
                 "source": "rendered_product_page",
                 "source_url": response.url,
+                "fields": fields,
                 "raw_values": raw_values,
             }
         )
@@ -1039,7 +1113,11 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "certificate_lab",
         ):
             if key in values:
-                details[key] = None if str(values[key]).strip() == "-" else values[key]
+                details[key] = (
+                    None
+                    if str(values[key]).strip() in {"-", "—", "–"}
+                    else values[key]
+                )
 
         if "carat" in values:
             details["carat"] = self._diamond_number(values["carat"])
@@ -1077,6 +1155,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
 
         product["diamond_details"] = details
         product["product_family"] = "loose_diamond"
+        assign_loose_diamond_category(product)
         self._merge_diamond_detail_attributes(product, details)
 
     @staticmethod
@@ -1207,10 +1286,42 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "description": _clean_html(
                 raw.get("description") or raw.get("variation_description")
             ),
+            "details": self._variation_details(raw),
             "weight": raw.get("weight"),
             "dimensions": raw.get("dimensions"),
             "raw": raw,
         }
+
+    @staticmethod
+    def _variation_details(raw: dict[str, Any]) -> dict[str, dict[str, str]]:
+        """Preserve dynamically named per-variation specifications."""
+
+        details: dict[str, dict[str, str]] = {}
+
+        def retain(label: Any, value: Any) -> None:
+            label_text = _clean_html(label).strip()
+            value_text = _clean_html(value).strip()
+            key = re.sub(r"[^a-z0-9]+", "_", label_text.lower()).strip("_")
+            if key and value_text:
+                details[key] = {"label": label_text, "value": value_text}
+
+        for field_name in ("section1data", "section2data", "product_details"):
+            payload = raw.get(field_name)
+            if isinstance(payload, dict):
+                for label, value in payload.items():
+                    if not isinstance(value, (dict, list, tuple)):
+                        retain(label, value)
+            elif isinstance(payload, (list, tuple)):
+                for item in payload:
+                    if isinstance(item, dict):
+                        label = item.get("label") or item.get("name") or item.get("key")
+                        value = item.get("value") or item.get("text")
+                        if label and value not in (None, ""):
+                            retain(label, value)
+                    elif isinstance(item, str) and ":" in item:
+                        label, value = item.split(":", 1)
+                        retain(label, value)
+        return details
 
     def _variation_gallery(
         self, raw: dict[str, Any], featured_url: str | None
@@ -1225,8 +1336,22 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             if not value:
                 return
             if isinstance(value, dict):
+                srcset_url = None
+                srcset_width = -1
+                srcset = html.unescape(str(value.get("srcset") or ""))
+                for candidate in srcset.split(","):
+                    parts = candidate.strip().rsplit(None, 1)
+                    if not parts:
+                        continue
+                    width_match = re.fullmatch(r"(\d+)w", parts[-1])
+                    width = int(width_match.group(1)) if width_match else 0
+                    candidate_url = parts[0] if width_match else candidate.strip()
+                    if candidate_url.startswith(("http://", "https://")) and width > srcset_width:
+                        srcset_url = candidate_url
+                        srcset_width = width
                 url = (
                     value.get("full_src")
+                    or srcset_url
                     or value.get("src")
                     or value.get("url")
                     or value.get("thumbnail")
@@ -1299,6 +1424,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             "images",
             "gallery",
             "gallery_images",
+            "wvg_images",
             "variation_images",
             "variation_gallery_images",
             "woo_variation_gallery_images",
@@ -1684,7 +1810,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 or select_name.replace("attribute_", "").replace("pa_", "").replace("-", " ")
             )
             options = [
-                option.attrib.get("value") or _text(option.css("::text").getall())
+                _text(option.css("::text").getall()) or option.attrib.get("value")
                 for option in select.css("option")
                 if option.attrib.get("value")
             ]
@@ -1917,6 +2043,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             or ""
         )
         if (
+            not self.enrichment_mode
+            and
             product_id
             and product_id in self.existing_product_ids
             and product_id not in self.refresh_product_ids
@@ -2061,6 +2189,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
     def _record_block(self, response: Response) -> None:
         if not self._is_blocked(response):
             return
+        already_blocked = self.access_blocked
         self.access_blocked = True
         reason_text = _text(
             response.xpath(
@@ -2077,6 +2206,10 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             self.block_reason = "Access from the crawler's country was disabled."
         else:
             self.block_reason = "Sucuri website firewall denied access."
+        crawler = getattr(self, "crawler", None)
+        engine = getattr(crawler, "engine", None)
+        if engine is not None and not already_blocked:
+            engine.close_spider(self, reason="access_blocked")
 
     def errback_request(self, failure):
         request = failure.request

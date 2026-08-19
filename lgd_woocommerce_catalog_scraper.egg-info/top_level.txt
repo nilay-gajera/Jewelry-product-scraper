@@ -1,2 +1,0 @@
-lgd_scraper
-service

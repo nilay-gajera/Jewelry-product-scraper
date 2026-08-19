@@ -8,7 +8,9 @@ from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+
+from lgd_scraper.catalog_rules import LOOSE_DIAMOND_CATEGORY
 
 
 MASTER_FILENAME = "woocommerce-master.csv"
@@ -168,15 +170,53 @@ def _product_sku(product: dict[str, Any]) -> str:
     return source_sku or f"LGD-P-{product.get('id')}"
 
 
-def _variation_sku(product: dict[str, Any], variation: dict[str, Any]) -> str:
+def _product_name(product: dict[str, Any]) -> str:
+    """Return only a source-provided import name, including its exact slug."""
+
+    source_name = str(product.get("name") or "").strip()
+    if source_name:
+        return source_name
+    return str(product.get("slug") or "").strip()
+
+
+def _variation_sku(
+    product: dict[str, Any],
+    variation: dict[str, Any],
+    parent_sku: str | None = None,
+) -> str:
     variation_id = variation.get("id") or _slug(
         json.dumps(variation.get("attributes", {}), sort_keys=True)
     )[:24]
-    parent_sku = _product_sku(product)
+    source_parent_sku = _product_sku(product)
+    resolved_parent_sku = parent_sku or source_parent_sku
     source_sku = str(variation.get("sku") or "").strip()
-    if source_sku and source_sku != parent_sku:
+    if source_sku and source_sku not in {
+        source_parent_sku,
+        resolved_parent_sku,
+    }:
         return source_sku
-    return f"{parent_sku}-V-{variation_id}"
+    return f"{resolved_parent_sku}-V-{variation_id}"
+
+
+def _reserve_unique_sku(
+    requested_sku: str,
+    used_skus: set[str],
+    collision_suffix: str,
+) -> str:
+    """Reserve a stable WooCommerce-safe unique SKU without losing source data."""
+
+    if requested_sku not in used_skus:
+        used_skus.add(requested_sku)
+        return requested_sku
+
+    stem = f"{requested_sku}-{collision_suffix}"
+    candidate = stem
+    counter = 2
+    while candidate in used_skus:
+        candidate = f"{stem}-{counter}"
+        counter += 1
+    used_skus.add(candidate)
+    return candidate
 
 
 def _published(status: Any) -> int | str:
@@ -188,7 +228,10 @@ def _published(status: Any) -> int | str:
         return 2
     if status:
         return -1
-    return ""
+    # Store API catalog records are public products but do not expose the
+    # authenticated REST API status field. WooCommerce interprets a blank CSV
+    # value as draft, so preserve their public catalog state explicitly.
+    return 1
 
 
 def _stock_flag(stock_status: Any) -> int | str:
@@ -198,6 +241,13 @@ def _stock_flag(stock_status: Any) -> int | str:
     if normalized in {"instock", "in-stock", "onbackorder", "on-backorder"}:
         return 1
     return ""
+
+
+def _catalog_visibility(value: Any) -> str:
+    """Return WooCommerce's valid default when source visibility is absent."""
+
+    normalized = str(value or "").strip().lower()
+    return normalized or "visible"
 
 
 def _bool_flag(value: Any) -> int | str:
@@ -211,6 +261,11 @@ def _bool_flag(value: Any) -> int | str:
     if normalized in {"0", "false", "no", "off"}:
         return 0
     return ""
+
+
+def _published_flag(value: Any) -> int:
+    flag = _bool_flag(value)
+    return flag if flag != "" else 1
 
 
 def _backorders_value(value: Any) -> int | str:
@@ -342,6 +397,28 @@ def _media_url(media: dict[str, Any], public_base_url: str | None) -> str:
     return ""
 
 
+def _media_identity(media: dict[str, Any], resolved_url: str = "") -> str:
+    """Identify the underlying image even when source hosts/filenames differ."""
+
+    source_url = str(media.get("source_url") or "").strip()
+    if source_url:
+        source_path = unquote(urlparse(source_url).path).rstrip("/").lower()
+        if source_path:
+            # The product page and JSON-LD commonly expose the same upload via
+            # www and CDN hosts. CDN re-encoding changes the byte checksum, but
+            # the host-independent WordPress upload path remains authoritative.
+            return f"source_path:{source_path}"
+
+    checksum = str(media.get("checksum") or "").strip().lower()
+    if checksum:
+        return f"checksum:{checksum}"
+    url = str(resolved_url or media.get("source_url") or "").strip()
+    if url:
+        return f"url:{url}"
+    local_path = str(media.get("local_path") or "").strip().lstrip("/")
+    return f"path:{local_path}" if local_path else ""
+
+
 def _product_image_urls(
     product: dict[str, Any], public_base_url: str | None
 ) -> list[str]:
@@ -359,8 +436,9 @@ def _product_image_urls(
         if item.get("role") in {"variation", "variation_gallery"}:
             continue
         url = _media_url(item, public_base_url)
-        if url and url not in seen:
-            seen.add(url)
+        identity = _media_identity(item, url)
+        if url and identity not in seen:
+            seen.add(identity)
             result.append(url)
     return result
 
@@ -369,6 +447,7 @@ def _media_paths(
     product: dict[str, Any], variation_id: str | None = None
 ) -> list[str]:
     result: list[str] = []
+    seen: set[str] = set()
     for media in product.get("media") or []:
         media_variation_id = str(media.get("variation_id") or "")
         if variation_id is None:
@@ -377,7 +456,9 @@ def _media_paths(
         elif media_variation_id != str(variation_id):
             continue
         path = str(media.get("local_path") or "").lstrip("/")
-        if path and path not in result:
+        identity = _media_identity(media)
+        if path and identity not in seen:
+            seen.add(identity)
             result.append(path)
     return result
 
@@ -389,17 +470,22 @@ def _variation_image_urls(
 ) -> list[str]:
     variation_id = str(variation.get("id") or "")
     result: list[str] = []
+    seen: set[str] = set()
     for media in product.get("media") or []:
         if media.get("role") not in {"variation", "variation_gallery"}:
             continue
         if str(media.get("variation_id") or "") != variation_id:
             continue
         url = _media_url(media, public_base_url)
-        if url and url not in result:
+        identity = _media_identity(media, url)
+        if url and identity not in seen:
+            seen.add(identity)
             result.append(url)
     for image in variation.get("gallery") or []:
         url = _media_url(image, public_base_url)
-        if url and url not in result:
+        identity = _media_identity(image, url)
+        if url and identity not in seen:
+            seen.add(identity)
             result.append(url)
     return result
 
@@ -432,6 +518,7 @@ def _product_categories(
     connection: sqlite3.Connection,
     product_id: str,
     category_paths: dict[str, str],
+    product: dict[str, Any] | None = None,
 ) -> str:
     rows = connection.execute(
         """
@@ -443,10 +530,24 @@ def _product_categories(
         (product_id,),
     ).fetchall()
     values: list[str] = []
-    for category_id, _category_name in rows:
-        value = category_paths.get(str(category_id), "")
+    for category_id, category_name in rows:
+        # Product assignments are authoritative even when a synthetic/import
+        # category has no separate row in the source category index.
+        value = category_paths.get(str(category_id), "") or str(
+            category_name or ""
+        )
         if value and value not in values:
             values.append(value)
+    if (
+        product
+        and product.get("product_family") == "loose_diamond"
+        and not values
+    ):
+        # The Store API identifies these records precisely but publishes no
+        # category assignment, causing WooCommerce to place every imported
+        # diamond in Uncategorized. This is an explicit product-family mapping,
+        # retained in row metadata below for auditability.
+        values.append(LOOSE_DIAMOND_CATEGORY)
     return ", ".join(_escape_list_value(value) for value in values)
 
 
@@ -534,10 +635,58 @@ def _row_metadata(
     if variation is None:
         details = product.get("diamond_details")
         if isinstance(details, dict):
+            dynamic_fields = details.get("fields")
+            if isinstance(dynamic_fields, dict):
+                for field_key, field in dynamic_fields.items():
+                    if not isinstance(field, dict):
+                        continue
+                    normalized = _slug(field_key).replace("-", "_")
+                    if not normalized:
+                        continue
+                    retain(f"_diamond_{normalized}", field.get("value"))
+                    if field.get("description"):
+                        retain(
+                            f"_diamond_{normalized}_description",
+                            field.get("description"),
+                        )
             for key, value in details.items():
+                if key in {"fields", "raw_values"}:
+                    continue
                 normalized = _slug(key).replace("-", "_")
                 if normalized:
-                    retain(f"_diamond_{normalized}", value)
+                    metadata.setdefault(f"_diamond_{normalized}", value)
+        if product.get("product_family"):
+            retain("_source_product_family", product.get("product_family"))
+        category_assignment = next(
+            (
+                category.get("assignment_source")
+                for category in product.get("categories") or []
+                if isinstance(category, dict) and category.get("assignment_source")
+            ),
+            None,
+        )
+        if product.get("product_family") == "loose_diamond" and (
+            category_assignment or not (product.get("categories") or [])
+        ):
+            retain(
+                "_category_assignment_source",
+                category_assignment or "product_family:loose_diamond",
+            )
+        seo = product.get("seo")
+        if isinstance(seo, dict):
+            for key, value in seo.items():
+                normalized = _slug(key).replace("-", "_")
+                if normalized and value not in (None, "", [], {}):
+                    retain(f"_seo_{normalized}", value)
+    else:
+        details = variation.get("details")
+        if isinstance(details, dict):
+            for field_key, field in details.items():
+                if not isinstance(field, dict):
+                    continue
+                normalized = _slug(field_key).replace("-", "_")
+                if normalized and field.get("value") not in (None, ""):
+                    retain(f"_variation_detail_{normalized}", field.get("value"))
 
     system_metadata: OrderedDict[str, Any] = OrderedDict(
         [
@@ -589,20 +738,45 @@ def _row_metadata(
 def _attribute_defs(product: dict[str, Any]) -> list[dict[str, Any]]:
     definitions: OrderedDict[str, dict[str, Any]] = OrderedDict()
     variations = product.get("variations") or []
+    real_variation_values: dict[str, list[str]] = {}
+    seen_variation_keys: set[str] = set()
+    for variation in variations:
+        for raw_key, raw_value in (variation.get("attributes") or {}).items():
+            key = _slug(str(raw_key).replace("attribute_", "").replace("pa_", ""))
+            if not key:
+                continue
+            seen_variation_keys.add(key)
+            value = _option_name(raw_value)
+            # Some source rows contain placeholders like "Ring Size = Ring
+            # Size" or "Back Setting = Back Setting". They describe no real
+            # option and must not make WooCommerce mark the attribute as used
+            # for variations.
+            if value and _slug(value) != key:
+                real_variation_values.setdefault(key, []).append(value)
 
     for index, attribute in enumerate(product.get("attributes") or []):
         name = str(attribute.get("name") or attribute.get("taxonomy") or f"Attribute {index + 1}")
         taxonomy = str(attribute.get("taxonomy") or attribute.get("slug") or "")
         key = _slug(taxonomy.replace("pa_", "") or name)
+        terms = _as_list(attribute.get("terms"))
+        options = _as_list(attribute.get("options"))
+        source_values = terms if any(
+            isinstance(term, dict) and _option_name(term) for term in terms
+        ) else options or terms
         values = [
             value
-            for value in (_option_name(option) for option in _as_list(
-                attribute.get("options") or attribute.get("terms")
-            ))
+            for value in (_option_name(option) for option in source_values)
             if value
         ]
         raw_id = attribute.get("id")
         numeric_global = str(raw_id or "").isdigit() and int(raw_id or 0) > 0
+        variation_flag = _bool_flag(attribute.get("variation"))
+        if variation_flag == "":
+            variation_flag = _bool_flag(attribute.get("has_variations"))
+        if variation_flag == "":
+            variation_flag = 0
+        if key in seen_variation_keys and not real_variation_values.get(key):
+            variation_flag = 0
         definitions[key] = {
             "name": name,
             "key": key,
@@ -613,14 +787,22 @@ def _attribute_defs(product: dict[str, Any]) -> list[dict[str, Any]]:
                 or bool(attribute.get("taxonomy"))
                 or numeric_global
             ),
+            "variation": variation_flag,
             "default": "",
         }
+        for term in terms:
+            if isinstance(term, dict) and _bool_flag(term.get("default")) == 1:
+                definitions[key]["default"] = _option_name(term)
+                break
 
     for variation in variations:
         attributes = variation.get("attributes") or {}
         for raw_key, raw_value in attributes.items():
             key = _slug(str(raw_key).replace("attribute_", "").replace("pa_", ""))
             if not key:
+                continue
+            value = _option_name(raw_value)
+            if not value or _slug(value) == key:
                 continue
             if key not in definitions:
                 definitions[key] = {
@@ -629,10 +811,13 @@ def _attribute_defs(product: dict[str, Any]) -> list[dict[str, Any]]:
                     "values": [],
                     "visible": "",
                     "global": int(str(raw_key).startswith("pa_")),
+                    "variation": 1,
                     "default": "",
                 }
-            value = _option_name(raw_value)
-            if value and value not in definitions[key]["values"]:
+            if value and not any(
+                _slug(existing) == _slug(value)
+                for existing in definitions[key]["values"]
+            ):
                 definitions[key]["values"].append(value)
 
     for default in product.get("default_attributes") or []:
@@ -644,8 +829,17 @@ def _attribute_defs(product: dict[str, Any]) -> list[dict[str, Any]]:
             .replace("pa_", "")
         )
         if key in definitions:
-            definitions[key]["default"] = _option_name(
+            source_default = _option_name(
                 default.get("option") or default.get("value")
+            )
+            default_slug = _slug(source_default)
+            definitions[key]["default"] = next(
+                (
+                    str(display_value)
+                    for display_value in definitions[key]["values"]
+                    if _slug(display_value) == default_slug
+                ),
+                source_default,
             )
 
     return list(definitions.values())
@@ -661,7 +855,12 @@ def _variation_attribute_value(
             str(key).replace("attribute_", "").replace("pa_", "")
         )
         if normalized == target:
-            return _option_name(value)
+            source_value = _option_name(value)
+            source_slug = _slug(source_value)
+            for display_value in definition.get("values") or []:
+                if _slug(display_value) == source_slug:
+                    return str(display_value)
+            return source_value
     return ""
 
 
@@ -688,7 +887,9 @@ def _base_product_row(
     if not isinstance(dimensions, dict):
         dimensions = {}
     images = _product_image_urls(product, public_base_url)
-    categories = _product_categories(connection, product_id, category_paths)
+    categories = _product_categories(
+        connection, product_id, category_paths, product
+    )
     product_type = _type_value(product)
     backorders = _product_field(product, "backorders")
 
@@ -699,10 +900,12 @@ def _base_product_row(
         "GTIN, UPC, EAN, or ISBN": _product_field(
             product, "global_unique_id"
         ),
-        "Name": product.get("name") or "",
+        "Name": _product_name(product),
         "Published": _published(product.get("status")),
         "Is featured?": _bool_flag(_product_field(product, "featured")),
-        "Visibility in catalog": _product_field(product, "catalog_visibility"),
+        "Visibility in catalog": _catalog_visibility(
+            _product_field(product, "catalog_visibility")
+        ),
         "Short description": _product_field(product, "short_description"),
         "Description": _product_field(product, "description"),
         "Date sale price starts": _date_value(
@@ -779,9 +982,11 @@ def _variation_row(
                 variation, "global_unique_id"
             ),
             "Name": variation.get("name") or "",
-            "Published": _bool_flag(_variation_field(variation, "visible")),
-            "Visibility in catalog": _variation_field(
-                variation, "catalog_visibility"
+            "Published": _published_flag(
+                _variation_field(variation, "visible")
+            ),
+            "Visibility in catalog": _catalog_visibility(
+                _variation_field(variation, "catalog_visibility")
             ),
             "Short description": _variation_field(
                 variation, "short_description"
@@ -825,6 +1030,8 @@ def _variation_row(
         }
     )
     for index, definition in enumerate(definitions, 1):
+        if not definition["variation"]:
+            continue
         row[f"Attribute {index} name"] = definition["name"]
         row[f"Attribute {index} value(s)"] = _escape_list_value(
             _variation_attribute_value(variation, definition)
@@ -922,7 +1129,7 @@ def validate_woocommerce_csv(path: Path) -> dict[str, int]:
                 errors.append(f"row {line_number}: Name is empty")
 
             published = str(row.get("Published") or "").strip()
-            if published not in {"", "-1", "0", "1", "2"}:
+            if published not in {"-1", "0", "1", "2"}:
                 errors.append(
                     f"row {line_number}: invalid Published value {published!r}"
                 )
@@ -938,7 +1145,7 @@ def validate_woocommerce_csv(path: Path) -> dict[str, int]:
                     f"row {line_number}: invalid backorders value {backorders!r}"
                 )
             visibility = str(row.get("Visibility in catalog") or "").strip()
-            if visibility not in {"", "visible", "catalog", "search", "hidden"}:
+            if visibility not in {"visible", "catalog", "search", "hidden"}:
                 errors.append(
                     f"row {line_number}: invalid catalog visibility {visibility!r}"
                 )
@@ -1080,17 +1287,61 @@ def export_woocommerce_csvs(
     maximum_attributes = 0
     maximum_downloads = 0
     product_skus: dict[str, str] = {}
+    variation_skus: dict[tuple[str, int], str] = {}
+    used_skus: set[str] = set()
     metadata_keys: OrderedDict[str, None] = OrderedDict()
+
+    # WooCommerce requires one global SKU namespace across parents and
+    # variations. Reserve every parent first so variation collisions can never
+    # break Parent references or product-to-product relationships.
     for (raw_json,) in connection.execute(
         "SELECT raw_json FROM products ORDER BY id"
     ):
         product = json.loads(raw_json)
-        product_skus[str(product.get("id") or "")] = _product_sku(product)
+        product_id = str(product.get("id") or "")
+        source_sku = _product_sku(product)
+        product_skus[product_id] = _reserve_unique_sku(
+            source_sku,
+            used_skus,
+            f"P-{product_id}",
+        )
+
+    for (raw_json,) in connection.execute(
+        "SELECT raw_json FROM products ORDER BY id"
+    ):
+        product = json.loads(raw_json)
+        product_id = str(product.get("id") or "")
+        resolved_product_sku = product_skus[product_id]
+        raw_product_sku = str(product.get("sku") or "").strip()
+        if raw_product_sku and raw_product_sku != resolved_product_sku:
+            metadata_keys.setdefault("_source_sku", None)
         maximum_attributes = max(maximum_attributes, len(_attribute_defs(product)))
         maximum_downloads = max(maximum_downloads, len(_downloads(product)))
         for key in _row_metadata(product):
             metadata_keys.setdefault(key, None)
-        for variation in product.get("variations") or []:
+        for variation_index, variation in enumerate(
+            product.get("variations") or []
+        ):
+            requested_variation_sku = _variation_sku(
+                product,
+                variation,
+                resolved_product_sku,
+            )
+            variation_id = variation.get("id") or variation_index + 1
+            resolved_variation_sku = _reserve_unique_sku(
+                requested_variation_sku,
+                used_skus,
+                f"V-{product_id}-{variation_id}",
+            )
+            variation_skus[(product_id, variation_index)] = (
+                resolved_variation_sku
+            )
+            raw_variation_sku = str(variation.get("sku") or "").strip()
+            if (
+                raw_variation_sku
+                and raw_variation_sku != resolved_variation_sku
+            ):
+                metadata_keys.setdefault("_source_sku", None)
             maximum_downloads = max(
                 maximum_downloads, len(_downloads(variation, True))
             )
@@ -1148,6 +1399,9 @@ def export_woocommerce_csvs(
                     product_skus,
                     public_base_url,
                 )
+                product_id = str(product.get("id") or "")
+                resolved_product_sku = product_skus[product_id]
+                parent["SKU"] = resolved_product_sku
                 _apply_downloads(parent, _downloads(product))
                 for index, definition in enumerate(definitions, 1):
                     parent[f"Attribute {index} name"] = definition["name"]
@@ -1160,21 +1414,43 @@ def export_woocommerce_csvs(
                     )
                     parent[f"Attribute {index} visible"] = definition["visible"]
                     parent[f"Attribute {index} global"] = definition["global"]
-                for key, value in _row_metadata(product).items():
+                parent_metadata = _row_metadata(product)
+                raw_product_sku = str(product.get("sku") or "").strip()
+                if raw_product_sku and raw_product_sku != resolved_product_sku:
+                    parent_metadata.setdefault("_source_sku", raw_product_sku)
+                for key, value in parent_metadata.items():
                     parent[f"meta:{key}"] = _meta_value(value)
                 writer.writerow(
                     {key: _csv_safe(value) for key, value in parent.items()}
                 )
                 parent_count += 1
 
-                for variation in product.get("variations") or []:
+                for variation_index, variation in enumerate(
+                    product.get("variations") or []
+                ):
                     variation_row = _variation_row(
                         product, variation, definitions, public_base_url
                     )
+                    resolved_variation_sku = variation_skus[
+                        (product_id, variation_index)
+                    ]
+                    variation_row["SKU"] = resolved_variation_sku
+                    variation_row["Parent"] = resolved_product_sku
                     _apply_downloads(
                         variation_row, _downloads(variation, True)
                     )
-                    for key, value in _row_metadata(product, variation).items():
+                    variation_metadata = _row_metadata(product, variation)
+                    raw_variation_sku = str(
+                        variation.get("sku") or ""
+                    ).strip()
+                    if (
+                        raw_variation_sku
+                        and raw_variation_sku != resolved_variation_sku
+                    ):
+                        variation_metadata.setdefault(
+                            "_source_sku", raw_variation_sku
+                        )
+                    for key, value in variation_metadata.items():
                         variation_row[f"meta:{key}"] = _meta_value(value)
                     writer.writerow(
                         {

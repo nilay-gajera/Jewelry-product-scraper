@@ -134,7 +134,7 @@ if (ADMIN_DIST / "assets").exists():
 
 class CrawlSettings(BaseModel):
     base_url: HttpUrl = "https://www.loosegrowndiamond.com/"
-    mode: Literal["test", "full"] = "test"
+    mode: Literal["test", "full", "enrich"] = "test"
     max_products: int = Field(default=5, ge=0, le=1_000_000)
     concurrency: int = Field(default=2, ge=1, le=16)
     download_delay: float = Field(default=1.0, ge=0.1, le=60)
@@ -149,7 +149,7 @@ class CrawlSettings(BaseModel):
 
 class StartRequest(BaseModel):
     base_url: HttpUrl | None = None
-    mode: Literal["test", "full"] | None = None
+    mode: Literal["test", "full", "enrich"] | None = None
     max_products: int | None = Field(default=None, ge=0, le=1_000_000)
     concurrency: int | None = Field(default=None, ge=1, le=16)
     download_delay: float | None = Field(default=None, ge=0.1, le=60)
@@ -322,9 +322,18 @@ def _configure_crawl_environment(config: dict[str, Any], run_id: str) -> dict[st
             "SCRAPER_RETRY_TIMES": str(config["retry_times"]),
             "SCRAPER_DOWNLOAD_MEDIA": "1" if config["download_media"] else "0",
             "SCRAPER_OBEY_ROBOTS": "1" if config["obey_robots"] else "0",
-            "SCRAPER_USE_PLAYWRIGHT": "1" if config.get("mode") == "enrich" else "0",
+            # Diamond details and productVariations are server-rendered. Avoid
+            # Chromium here so enrichment stays within small-instance memory.
+            "SCRAPER_USE_PLAYWRIGHT": "0",
         }
     )
+    if config["mode"] == "enrich":
+        # A full catalog database is hundreds of MB before compression. Keep
+        # enrichment restart-safe without uploading the whole snapshot after
+        # every small batch.
+        environment["S3_UPLOAD_EVERY"] = environment.get(
+            "S3_ENRICH_UPLOAD_EVERY", "500"
+        )
     proxy = environment.get("SCRAPER_PROXY_URL")
     if proxy:
         environment["HTTPS_PROXY"] = proxy
@@ -450,6 +459,11 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
 
         config = _merged_start_settings(request)
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        if config["mode"] == "enrich" and not config["resume_checkpoint"]:
+            raise HTTPException(
+                409,
+                "Enrichment requires Resume from checkpoint to remain enabled.",
+            )
         if config["resume_checkpoint"]:
             try:
                 checkpoint_restored = download_checkpoint(EXPORT_DIR, strict=True)
@@ -458,6 +472,11 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
         else:
             _clear_local_catalog()
             checkpoint_restored = False
+        if config["mode"] == "enrich" and not DATABASE_PATH.exists():
+            raise HTTPException(
+                409,
+                "Enrichment requires the existing catalog checkpoint. Enable Resume from checkpoint first.",
+            )
         PROGRESS_PATH.unlink(missing_ok=True)
         (EXPORT_DIR / "s3-upload-error.json").unlink(missing_ok=True)
         environment = _configure_crawl_environment(config, run_id)
@@ -478,7 +497,9 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
             "-a",
             f"enrich_html={'true' if config['enrich_html'] else 'false'}",
             "-a",
-            f"resume_existing={'true' if config['resume_checkpoint'] and DATABASE_PATH.exists() else 'false'}",
+            f"resume_existing={'true' if config['mode'] != 'enrich' and config['resume_checkpoint'] and DATABASE_PATH.exists() else 'false'}",
+            "-a",
+            f"enrichment_mode={'true' if config['mode'] == 'enrich' else 'false'}",
             "-a",
             "use_playwright=false",
         ]
@@ -502,7 +523,11 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
             "config": config,
             "checkpoint_restored": checkpoint_restored,
             "summary": None,
-            "message": "Crawl is running. Checkpoints are saved to S3.",
+            "message": (
+                "Catalog enrichment is running against the saved checkpoint."
+                if config["mode"] == "enrich"
+                else "Crawl is running. Checkpoints are saved to S3."
+            ),
         }
         _write_state(state)
         _persist_run(state)

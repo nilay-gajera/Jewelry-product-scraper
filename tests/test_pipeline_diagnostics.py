@@ -4,6 +4,9 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
+from scrapy import Request
+
+from lgd_scraper.pipelines import CatalogMediaPipeline
 from lgd_scraper.pipelines import CatalogWriterPipeline
 
 
@@ -70,6 +73,37 @@ def test_identical_diagnostics_are_written_once_per_run(tmp_path):
     assert len(
         (tmp_path / "diagnostics.jsonl").read_text(encoding="utf-8").splitlines()
     ) == 1
+    _close_pipeline(pipeline)
+
+
+def test_failed_media_transfer_is_visible_as_a_catalog_diagnostic(tmp_path):
+    product = {
+        "_record_type": "product",
+        "id": "99",
+        "name": "Adriana Ring",
+        "url": "https://example.test/product/adriana/",
+        "type": "simple",
+        "media": [{"source_url": "https://example.test/missing.jpg"}],
+        "categories": [],
+        "attributes": [],
+        "variations": [],
+    }
+    failure = SimpleNamespace(
+        request=Request("https://example.test/missing.jpg"),
+        value=RuntimeError("download failed"),
+    )
+    completed = CatalogMediaPipeline.item_completed(
+        None, [(False, failure)], product, None
+    )
+    pipeline = _pipeline(tmp_path)
+    pipeline.open_spider()
+    pipeline.process_item(completed)
+
+    assert completed["media_download_failures"][0]["url"].endswith("missing.jpg")
+    assert pipeline.counts["diagnostic"] == 1
+    assert pipeline.connection.execute(
+        "SELECT kind FROM diagnostics"
+    ).fetchone()[0] == "media_download_failed"
     _close_pipeline(pipeline)
 
 
