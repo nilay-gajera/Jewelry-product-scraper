@@ -224,14 +224,14 @@ def _tail(path: Path, lines: int, block_size: int = 64 * 1024) -> str:
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
-            end = position = handle.tell()
+            position = handle.tell()
             chunks: list[bytes] = []
             while position > 0 and sum(chunk.count(b"\n") for chunk in chunks) <= lines:
                 read_size = min(block_size, position)
                 position -= read_size
                 handle.seek(position)
                 chunks.append(handle.read(read_size))
-            data = b"".join(reversed(chunks))[-(end - position) :]
+            data = b"".join(reversed(chunks))
     except FileNotFoundError:
         return ""
     except OSError:
