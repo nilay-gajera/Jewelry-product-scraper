@@ -226,7 +226,15 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         """Refresh saved diamonds and variable products without recrawling the catalog."""
 
         database_path = Path(self.output_dir).resolve() / "catalog.sqlite"
+        self.logger.info(
+            "Enrichment: opening catalog checkpoint at %s (exists=%s)",
+            database_path,
+            database_path.exists(),
+        )
         if not database_path.exists():
+            self.logger.warning(
+                "Enrichment: catalog checkpoint not found at %s", database_path
+            )
             yield {
                 "_record_type": "diagnostic",
                 "kind": "enrichment_catalog_missing",
@@ -241,9 +249,17 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 f"file:{database_path}?mode=ro", uri=True, timeout=5
             )
             try:
+                total_count = connection.execute(
+                    "SELECT COUNT(*) FROM products"
+                ).fetchone()[0]
+                self.logger.info(
+                    "Enrichment: catalog contains %d products", total_count
+                )
                 cursor = connection.execute(
                     "SELECT raw_json FROM products ORDER BY id"
                 )
+                skipped_no_url = 0
+                skipped_family = 0
                 for (raw_json,) in cursor:
                     if self.max_products and self.products_scheduled >= self.max_products:
                         break
@@ -252,22 +268,35 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                     except (json.JSONDecodeError, TypeError):
                         continue
                     if not isinstance(product, dict) or not product.get("url"):
+                        skipped_no_url += 1
                         continue
                     if not (
                         product.get("product_family") == "loose_diamond"
                         or product.get("type") == "variable"
                         or product.get("variations")
                     ):
+                        skipped_family += 1
                         continue
                     if not self._needs_enrichment(product):
                         self.products_already_enriched += 1
                         continue
                     product["_record_type"] = "product"
                     self.products_scheduled += 1
-                    yield self._page_request(str(product["url"]), product)
+                    yield self._page_request(
+                        str(product["url"]), product, dont_filter=True
+                    )
+                self.logger.info(
+                    "Enrichment: scheduled=%d, already_enriched=%d, "
+                    "skipped_no_url=%d, skipped_family=%d",
+                    self.products_scheduled,
+                    self.products_already_enriched,
+                    skipped_no_url,
+                    skipped_family,
+                )
             finally:
                 connection.close()
         except sqlite3.Error as exc:
+            self.logger.error("Enrichment: catalog read failed: %s", exc)
             yield {
                 "_record_type": "diagnostic",
                 "kind": "enrichment_catalog_unreadable",
@@ -2107,7 +2136,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         return list(unique.values())
 
     def _page_request(
-        self, url: str, product: dict[str, Any] | None
+        self, url: str, product: dict[str, Any] | None, dont_filter: bool = False
     ) -> Request:
         meta: dict[str, Any] = {"request_kind": "product_page"}
         if self.use_playwright:
@@ -2133,6 +2162,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             cb_kwargs={"api_product": product},
             meta=meta,
             errback=self.errback_request,
+            dont_filter=dont_filter,
         )
 
     def _store_variation_request(
