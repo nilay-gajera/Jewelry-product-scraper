@@ -31,8 +31,22 @@ def s3_prefix() -> str:
 @lru_cache(maxsize=None)
 def _build_s3_client(region: str | None, endpoint: str | None):
     import boto3
+    from botocore.config import Config
 
-    return boto3.client("s3", region_name=region, endpoint_url=endpoint)
+    # botocore defaults to a 60s connect timeout with several retries, so an
+    # unreachable bucket can stall a caller for many minutes. Fail fast enough
+    # that the service stays responsive and the error surfaces to the operator.
+    return boto3.client(
+        "s3",
+        region_name=region,
+        endpoint_url=endpoint,
+        config=Config(
+            connect_timeout=int(os.getenv("S3_CONNECT_TIMEOUT", "10")),
+            read_timeout=int(os.getenv("S3_READ_TIMEOUT", "120")),
+            retries={"max_attempts": int(os.getenv("S3_MAX_ATTEMPTS", "3")),
+                     "mode": "standard"},
+        ),
+    )
 
 
 def s3_client():

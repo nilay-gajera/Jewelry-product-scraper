@@ -494,3 +494,125 @@ def test_control_token_check_handles_non_ascii(monkeypatch):
     with pytest.raises(Exception) as error:
         service._require_control("Bearer wrong")
     assert error.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Startup must never block on the network (Cloudflare 520 on Render)
+# ---------------------------------------------------------------------------
+
+
+def test_startup_does_not_block_on_the_checkpoint_restore(tmp_path, monkeypatch):
+    """A slow or unreachable bucket used to stop the app ever serving."""
+
+    from fastapi.testclient import TestClient
+
+    released = threading.Event()
+    entered = threading.Event()
+
+    def hanging_download(*args, **kwargs):
+        entered.set()
+        released.wait(timeout=10)
+        return False
+
+    monkeypatch.setattr(service, "DATABASE_PATH", tmp_path / "missing.sqlite")
+    monkeypatch.setattr(service, "EXPORT_DIR", tmp_path)
+    monkeypatch.setattr(service, "STATUS_PATH", tmp_path / "status.json")
+    monkeypatch.setattr(service, "download_checkpoint", hanging_download)
+    monkeypatch.setenv("CONTROL_TOKEN", "t")
+
+    try:
+        with TestClient(service.app) as client:
+            # Startup completed even though the restore is still in flight.
+            assert entered.wait(timeout=5), "restore should have started"
+            assert client.get("/health").status_code == 200
+            body = client.get(
+                "/api/status", headers={"Authorization": "Bearer t"}
+            ).json()
+            assert body["checkpoint_restore"]["state"] == "running"
+    finally:
+        released.set()
+
+
+def test_a_failed_restore_is_reported_rather_than_raised(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "DATABASE_PATH", tmp_path / "missing.sqlite")
+    monkeypatch.setattr(service, "EXPORT_DIR", tmp_path)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("bucket unreachable")
+
+    monkeypatch.setattr(service, "download_checkpoint", explode)
+
+    assert service._restore_runtime_checkpoint() is False
+    assert service.restore_state["state"] == "failed"
+    assert "bucket unreachable" in service.restore_state["error"]
+
+
+def test_restore_is_skipped_when_a_catalog_is_already_on_disk(tmp_path, monkeypatch):
+    database = tmp_path / "catalog.sqlite"
+    _seed_catalog(database)
+    monkeypatch.setattr(service, "DATABASE_PATH", database)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("must not download when the catalog is present")
+
+    monkeypatch.setattr(service, "download_checkpoint", explode)
+
+    assert service._restore_runtime_checkpoint() is False
+    assert service.restore_state["state"] == "skipped"
+
+
+def test_s3_client_uses_bounded_timeouts_and_retries(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "us-west-1")
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    s3sync._build_s3_client.cache_clear()
+
+    config = s3sync.s3_client().meta.config
+
+    assert config.connect_timeout == 10
+    assert config.read_timeout == 120
+    assert config.retries["total_max_attempts"] <= 4
+
+
+def test_mysql_failure_is_not_retried_on_every_request(monkeypatch, tmp_path):
+    """A down replica must not cost every poll its full connect timeout."""
+
+    from lgd_scraper import admin_data
+
+    database = tmp_path / "catalog.sqlite"
+    _seed_catalog(database)
+    attempts = []
+
+    def failing():
+        attempts.append(1)
+        raise OSError("connect timeout")
+
+    monkeypatch.setattr(admin_data, "mysql_enabled", lambda: True)
+    monkeypatch.setattr(admin_data, "mysql_read_connect", failing)
+    monkeypatch.setattr(admin_data, "_mysql_unavailable_until", 0.0)
+
+    for _ in range(5):
+        assert admin_data.catalog_summary(database)["products"] == 1
+
+    assert len(attempts) == 1, "MySQL should be retried on a timer, not per request"
+
+
+def test_mysql_is_retried_once_the_cooldown_expires(monkeypatch, tmp_path):
+    from lgd_scraper import admin_data
+
+    database = tmp_path / "catalog.sqlite"
+    _seed_catalog(database)
+    attempts = []
+
+    def failing():
+        attempts.append(1)
+        raise OSError("connect timeout")
+
+    monkeypatch.setattr(admin_data, "mysql_enabled", lambda: True)
+    monkeypatch.setattr(admin_data, "mysql_read_connect", failing)
+    monkeypatch.setattr(admin_data, "_mysql_unavailable_until", 0.0)
+
+    admin_data.catalog_summary(database)
+    admin_data._mysql_unavailable_until = 0.0  # cooldown elapsed
+    admin_data.catalog_summary(database)
+
+    assert len(attempts) == 2

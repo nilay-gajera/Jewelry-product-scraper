@@ -433,3 +433,4 @@ td > small { margin-top: 4px; color: var(--muted); font-size: .64rem; }
 .inspector-storefront { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 6px; }
 .inspector-storefront small { flex: 1 1 100%; line-height: 1.4; }
 .inspector-storefront small { color: var(--muted); font-size: .65rem; }
+.security-notice--error { color: var(--danger); border-color: rgba(197, 46, 53, .35); background: #fdf2f2; }

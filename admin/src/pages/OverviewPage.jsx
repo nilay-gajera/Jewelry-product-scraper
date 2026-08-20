@@ -30,6 +30,7 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
   const quality = catalog.quality || {};
   const enrichment = catalog.enrichment || {};
   const timeline = status?.timeline;
+  const restore = status?.checkpoint_restore;
   const media = status?.progress || {};
   // Prefer the product limit when there is one, otherwise fall back to how far
   // through the run's named steps we are.
@@ -82,6 +83,19 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
           <button className="text-button" onClick={() => onNavigate("runs")}>View crawl runs <Icon name="chevron" size={15} /></button>
         </div>
       </section>
+
+      {restore?.state === "running" || restore?.state === "failed" ? (
+        <div className={restore.state === "failed" ? "security-notice security-notice--error" : "security-notice"}>
+          <Icon name={restore.state === "failed" ? "alert" : "refresh"} />
+          <span>
+            {restore.state === "running" ? (
+              <><strong>Restoring the saved catalog from S3.</strong> The service starts with an empty disk, so counts below fill in once the checkpoint finishes downloading.</>
+            ) : (
+              <><strong>The saved catalog could not be restored.</strong> {restore.error || "Check the S3 credentials and bucket in Settings."} Starting a crawl with Resume from checkpoint will try again.</>
+            )}
+          </span>
+        </div>
+      ) : null}
 
       <section className="run-detail">
         <section className="panel panel--timeline">

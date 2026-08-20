@@ -105,12 +105,56 @@ def _new_service_progress(run_id: str, mode: str) -> PhaseTracker:
     return service_progress
 
 
+# Startup restore, reported so the dashboard can say the catalog is on its way
+# instead of showing an empty one.
+restore_state: dict[str, Any] = {
+    "state": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "restored": False,
+    "error": None,
+}
+
+
 def _restore_runtime_checkpoint() -> bool:
-    """Hydrate Render's ephemeral disk before the admin API serves data."""
+    """Hydrate Render's ephemeral disk so the admin API has data to serve.
+
+    Runs in the background: a container starts with an empty disk, so this
+    downloads and verifies the whole catalog. Blocking startup on it meant an
+    unreachable or merely large bucket kept the app from ever serving a
+    request, which the platform reports as a 520.
+    """
 
     if DATABASE_PATH.exists():
+        restore_state.update({"state": "skipped", "finished_at": _now()})
         return False
-    return download_checkpoint(EXPORT_DIR)
+
+    restore_state.update(
+        {"state": "running", "started_at": _now(), "error": None, "restored": False}
+    )
+    try:
+        with catalog_lock:
+            # A crawl started in the meantime already owns the catalog.
+            if DATABASE_PATH.exists():
+                restore_state.update({"state": "skipped", "finished_at": _now()})
+                return False
+            restored = download_checkpoint(EXPORT_DIR)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Startup checkpoint restore failed: %s", exc
+        )
+        restore_state.update(
+            {"state": "failed", "finished_at": _now(), "error": str(exc)}
+        )
+        return False
+    restore_state.update(
+        {
+            "state": "completed" if restored else "unavailable",
+            "finished_at": _now(),
+            "restored": restored,
+        }
+    )
+    return restored
 
 
 def _graceful_shutdown_crawl() -> None:
@@ -139,10 +183,23 @@ def _force_stop_after_timeout(
             current_process.kill()
 
 
+def _startup_tasks() -> None:
+    """Recover state and hydrate the catalog, off the startup path."""
+
+    try:
+        _recover_stale_process_state()
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Startup state recovery failed: %s", exc)
+    _restore_runtime_checkpoint()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await asyncio.to_thread(_restore_runtime_checkpoint)
-    await asyncio.to_thread(_recover_stale_process_state)
+    # Nothing that touches the network may run here: the port must start
+    # serving immediately, because the platform health check will not wait on
+    # S3. ``_read_state`` already normalises a stale "running" state on read,
+    # so persisting that recovery can happen in the background too.
+    threading.Thread(target=_startup_tasks, name="startup", daemon=True).start()
     try:
         yield
     finally:
@@ -569,6 +626,7 @@ def status() -> dict[str, Any]:
     crawl_progress = crawl_progress if isinstance(crawl_progress, dict) else None
     state["progress"] = crawl_progress
     state["timeline"] = _timeline(crawl_progress, state)
+    state["checkpoint_restore"] = dict(restore_state)
     state["storefront"] = _storefront_state(crawl_progress, state)
     state["catalog"] = catalog_summary(DATABASE_PATH, prefer_sqlite=running)
     return state

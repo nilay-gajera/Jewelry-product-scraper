@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -129,6 +130,14 @@ def _connect(database_path: Path) -> sqlite3.Connection | None:
     return connection
 
 
+# When MySQL is configured but down, every connection attempt costs its full
+# connect timeout. The dashboard polls several endpoints every five seconds, so
+# that alone can saturate the request threadpool. Stop trying for a short while
+# after a failure and serve the local checkpoint instead.
+_MYSQL_RETRY_AFTER_SECONDS = float(os.getenv("MYSQL_RETRY_AFTER_SECONDS", "60"))
+_mysql_unavailable_until = 0.0
+
+
 def _connect_mysql(prefer_sqlite: bool = False):
     """Return a MySQL connection or None if MySQL is not configured/reachable.
 
@@ -136,13 +145,24 @@ def _connect_mysql(prefer_sqlite: bool = False):
     refreshed after a crawl finishes, so while a crawl is writing local SQLite
     the replica is stale and must not be used.
     """
+    global _mysql_unavailable_until
+
     if prefer_sqlite or not mysql_enabled():
         return None
-    try:
-        return mysql_read_connect()
-    except Exception as exc:
-        _LOGGER.debug("MySQL unavailable, falling back to SQLite: %s", exc)
+    if time.monotonic() < _mysql_unavailable_until:
         return None
+    try:
+        connection = mysql_read_connect()
+    except Exception as exc:
+        _mysql_unavailable_until = time.monotonic() + _MYSQL_RETRY_AFTER_SECONDS
+        _LOGGER.warning(
+            "MySQL unavailable, serving the local checkpoint for %.0fs: %s",
+            _MYSQL_RETRY_AFTER_SECONDS,
+            exc,
+        )
+        return None
+    _mysql_unavailable_until = 0.0
+    return connection
 
 
 def _mysql_table_exists(connection, table: str) -> bool:
