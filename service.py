@@ -46,6 +46,12 @@ from lgd_scraper.mysql_backend import (
     mysql_enabled,
     sync_from_sqlite,
 )
+from lgd_scraper.run_progress import (
+    SERVICE_PHASES,
+    PhaseTracker,
+    merge_timeline,
+    write_json_atomic,
+)
 from lgd_scraper.s3sync import (
     delete_media_objects,
     download_checkpoint,
@@ -84,6 +90,19 @@ state_lock = threading.Lock()
 # 5-second dashboard poll blocks behind it and the request threadpool fills.
 catalog_lock = threading.Lock()
 process: subprocess.Popen[str] | None = None
+# Phases the service itself performs, around the child crawl. The crawl's own
+# phases live in progress.json and are spliced into this timeline by
+# ``_timeline``. Replaced at the start of every run.
+SERVICE_PROGRESS_PATH = RUNTIME_DIR / "service-progress.json"
+service_progress: PhaseTracker | None = None
+
+
+def _new_service_progress(run_id: str, mode: str) -> PhaseTracker:
+    global service_progress
+    service_progress = PhaseTracker(
+        SERVICE_PROGRESS_PATH, SERVICE_PHASES, run_id=run_id, mode=mode
+    )
+    return service_progress
 
 
 def _restore_runtime_checkpoint() -> bool:
@@ -183,6 +202,13 @@ class BulkDeleteRequest(BaseModel):
     delete_media: bool = False
 
 
+_MODE_LABELS = {
+    "test": "test run",
+    "full": "full catalog crawl",
+    "enrich": "saved-catalog enrichment",
+}
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -270,11 +296,7 @@ def _read_state() -> dict[str, Any]:
 
 
 def _write_state(state: dict[str, Any]) -> None:
-    temporary = STATUS_PATH.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    temporary.replace(STATUS_PATH)
+    write_json_atomic(STATUS_PATH, state)
 
 
 def _persist_run(state: dict[str, Any]) -> None:
@@ -420,12 +442,26 @@ def _clear_local_catalog() -> None:
 def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
     global process
     exit_code = current_process.wait()
+    progress = service_progress
     summary = _read_json(EXPORT_DIR / "crawl-summary.json")
+    if progress is not None:
+        progress.finish(
+            "crawl",
+            "Crawler finished."
+            if exit_code == 0
+            else f"Crawler exited with code {exit_code}.",
+        )
+        progress.start("archive", "Packaging the downloadable catalog archive")
     archive_error = None
     try:
         build_catalog_archive(EXPORT_DIR)
     except Exception as exc:
         archive_error = str(exc)
+    if progress is not None:
+        if archive_error:
+            progress.fail("archive", archive_error)
+        else:
+            progress.finish("archive", "catalog-export.zip is ready to download.")
     upload_error = _read_json(EXPORT_DIR / "s3-upload-error.json")
     successful = exit_code == 0 and not upload_error
     access_warning = bool(
@@ -483,13 +519,34 @@ def _watch_process(current_process: subprocess.Popen[str], run_id: str) -> None:
     # state with a database on disk is worth syncing -- otherwise the dashboard
     # keeps serving the previous run's catalog.
     if final_state != "failed" and mysql_enabled() and DATABASE_PATH.exists():
+        if progress is not None:
+            progress.start("replica", "Copying the catalog into the dashboard database")
         with catalog_lock:
             try:
-                sync_from_sqlite(DATABASE_PATH)
+                counts = sync_from_sqlite(DATABASE_PATH)
+                if progress is not None:
+                    progress.finish(
+                        "replica",
+                        f"{counts.get('products', 0):,} products available to the dashboard.",
+                    )
             except Exception as exc:
                 logging.getLogger(__name__).warning(
                     "Post-crawl MySQL sync failed: %s", exc
                 )
+                if progress is not None:
+                    progress.fail("replica", f"Dashboard database not refreshed: {exc}")
+    elif progress is not None:
+        progress.skip(
+            "replica",
+            "Not configured."
+            if not mysql_enabled()
+            else "Skipped because the run failed.",
+        )
+
+    if progress is not None:
+        progress.close_open_phases()
+        progress.set_extra(state=final_state, message=state.get("message"))
+        progress.flush()
 
 
 @app.get("/health")
@@ -508,10 +565,72 @@ def status() -> dict[str, Any]:
         state = _read_state()
         running = _process_running()
         state["process_running"] = running
-    progress = _read_json(PROGRESS_PATH)
-    state["progress"] = progress if isinstance(progress, dict) else None
+    crawl_progress = _read_json(PROGRESS_PATH)
+    crawl_progress = crawl_progress if isinstance(crawl_progress, dict) else None
+    state["progress"] = crawl_progress
+    state["timeline"] = _timeline(crawl_progress, state)
+    state["storefront"] = _storefront_state(crawl_progress, state)
     state["catalog"] = catalog_summary(DATABASE_PATH, prefer_sqlite=running)
     return state
+
+
+def _service_snapshot() -> dict[str, Any] | None:
+    """The service's own phases, from memory or from the last run on disk."""
+
+    if service_progress is not None:
+        return service_progress.snapshot()
+    stored = _read_json(SERVICE_PROGRESS_PATH)
+    return stored if isinstance(stored, dict) else None
+
+
+def _timeline(
+    crawl_progress: dict[str, Any] | None, state: dict[str, Any]
+) -> dict[str, Any]:
+    """One ordered list of every step, service and crawler alike."""
+
+    service_snapshot = _service_snapshot()
+    # Only splice in the crawler's phases when they belong to this run;
+    # a stale progress.json from a previous run must not be shown as current.
+    run_id = state.get("run_id")
+    if (
+        crawl_progress
+        and run_id
+        and crawl_progress.get("run_id")
+        and crawl_progress.get("run_id") != run_id
+    ):
+        crawl_progress = None
+    phases = merge_timeline(service_snapshot, crawl_progress)
+    active = next(
+        (phase for phase in phases if phase.get("state") == "active"), None
+    )
+    finished = [
+        phase
+        for phase in phases
+        if phase.get("state") in {"done", "skipped", "failed"}
+    ]
+    return {
+        "phases": phases,
+        "current": active,
+        "current_label": (active or {}).get("label"),
+        "current_detail": (active or {}).get("detail") or "",
+        "step": len(finished) + (1 if active else 0),
+        "completed": len(finished),
+        "steps": len(phases),
+        "failed": [phase for phase in phases if phase.get("state") == "failed"],
+    }
+
+
+def _storefront_state(
+    crawl_progress: dict[str, Any] | None, state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Latest storefront availability scan result, live or from the last run."""
+
+    if isinstance(crawl_progress, dict) and crawl_progress.get("storefront"):
+        return crawl_progress["storefront"]
+    summary = state.get("summary")
+    if isinstance(summary, dict) and summary.get("storefront"):
+        return summary["storefront"]
+    return None
 
 
 @app.get(
@@ -536,24 +655,47 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
 
         config = _merged_start_settings(request)
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        progress = _new_service_progress(run_id, config["mode"])
+        progress.start("prepare", f"Preparing a {_MODE_LABELS[config['mode']]}")
+
         if config["mode"] == "enrich" and not config["resume_checkpoint"]:
+            progress.fail(
+                "prepare", "Enrichment needs the saved checkpoint to stay enabled."
+            )
             raise HTTPException(
                 409,
                 "Enrichment requires Resume from checkpoint to remain enabled.",
             )
+        progress.finish("prepare", "Settings accepted.")
+
         if config["resume_checkpoint"]:
+            progress.start(
+                "restore", "Downloading the saved catalog checkpoint from S3"
+            )
             try:
                 checkpoint_restored = download_checkpoint(EXPORT_DIR, strict=True)
             except RuntimeError as exc:
+                progress.fail("restore", str(exc))
                 raise HTTPException(502, str(exc)) from exc
+            progress.finish(
+                "restore",
+                "Checkpoint restored."
+                if checkpoint_restored
+                else "No stored checkpoint yet; starting from the local catalog.",
+            )
         else:
+            progress.start("restore", "Clearing the local catalog for a fresh run")
             _clear_local_catalog()
             checkpoint_restored = False
+            progress.finish("restore", "Local catalog cleared.")
+
         if config["mode"] == "enrich" and not DATABASE_PATH.exists():
+            progress.fail("restore", "No saved catalog is available to enrich.")
             raise HTTPException(
                 409,
                 "Enrichment requires the existing catalog checkpoint. Enable Resume from checkpoint first.",
             )
+        progress.start("launch", "Starting the crawler process")
         PROGRESS_PATH.unlink(missing_ok=True)
         (EXPORT_DIR / "s3-upload-error.json").unlink(missing_ok=True)
         environment = _configure_crawl_environment(config, run_id)
@@ -610,6 +752,13 @@ def start_crawl(request: StartRequest) -> dict[str, Any]:
                 else "Crawl is running. Checkpoints are saved to S3."
             ),
         }
+        progress.finish("launch", f"Crawler started (run {run_id}).")
+        progress.start(
+            "crawl",
+            "Crawling"
+            if config["mode"] != "enrich"
+            else "Refreshing saved products from the live storefront",
+        )
         with state_lock:
             _write_state(state)
         _persist_run(state)
@@ -679,12 +828,7 @@ def refresh_discovery(request: DiscoveryRequest) -> dict[str, Any]:
         )
     except CatalogDiscoveryError as exc:
         raise HTTPException(502, str(exc)) from exc
-    DISCOVERY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = DISCOVERY_PATH.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    temporary.replace(DISCOVERY_PATH)
+    write_json_atomic(DISCOVERY_PATH, value)
     save_json_object(value, "admin", "catalog-discovery.json")
     return value
 
@@ -696,6 +840,7 @@ def get_products(
     category_id: str = Query(default="", max_length=100),
     stock_status: str = Query(default="", max_length=30),
     coverage: str = Query(default="", max_length=40),
+    storefront: str = Query(default="", max_length=20),
     sort: str = Query(default="name_asc", max_length=40),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
@@ -707,6 +852,7 @@ def get_products(
         category_id=category_id.strip(),
         stock_status=stock_status.strip(),
         coverage=coverage.strip(),
+        storefront=storefront.strip(),
         sort=sort.strip(),
         page=page,
         page_size=page_size,

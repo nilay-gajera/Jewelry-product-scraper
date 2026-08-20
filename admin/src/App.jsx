@@ -21,6 +21,7 @@ export function App() {
   const [checking, setChecking] = useState(Boolean(getToken()));
   const [page, setPage] = useState(pageFromHash);
   const [initialProductId, setInitialProductId] = useState("");
+  const [productFilters, setProductFilters] = useState(null);
   const [status, setStatus] = useState(null);
   const [settings, setSettings] = useState(null);
   const [products, setProducts] = useState({ items: [] });
@@ -81,8 +82,9 @@ export function App() {
     return () => window.removeEventListener("hashchange", handler);
   }, []);
 
-  function navigate(nextPage, productId = "") {
+  function navigate(nextPage, productId = "", filters = null) {
     setInitialProductId(productId);
+    setProductFilters(filters);
     setPage(nextPage);
     window.location.hash = nextPage;
   }
@@ -138,7 +140,7 @@ export function App() {
   return <AppShell page={page} onNavigate={navigate} onLogout={logout}>
     {notice ? <div className={`toast toast--${notice.tone}`} role="status"><span>{notice.message}</span><button onClick={() => setNotice(null)}>Dismiss</button></div> : null}
     {page === "overview" ? <OverviewPage status={status} settings={settings} products={products} logs={logs} busy={busy} onStart={start} onStop={stop} onDownload={download} onNavigate={navigate} /> : null}
-    {page === "products" ? <ProductsPage initialProductId={initialProductId} crawlActive={crawlActive} onError={showError} onDeleted={handleProductsDeleted} /> : null}
+    {page === "products" ? <ProductsPage initialProductId={initialProductId} initialFilters={productFilters} crawlActive={crawlActive} onError={showError} onDeleted={handleProductsDeleted} /> : null}
     {page === "runs" ? <RunsPage status={status} settings={settings} logs={logs} onStart={start} onStop={stop} onError={showError} /> : null}
     {page === "settings" ? <SettingsPage settings={settings} onSaved={(value) => { setSettings(value); setNotice({ tone: "success", message: "Settings saved to local runtime and S3." }); }} onError={showError} /> : null}
     {page === "exports" ? <ExportsPage status={status} settings={settings} onError={showError} /> : null}

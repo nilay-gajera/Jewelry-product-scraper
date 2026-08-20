@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { Icon } from "../icons.jsx";
 import { Button, EmptyState, Field, StatusMark, formatDate, formatNumber } from "../components/Ui.jsx";
+import { CurrentStep, RunTimeline, StorefrontPanel } from "../components/RunTimeline.jsx";
 
 const counters = [
   ["products", "products"],
@@ -20,11 +21,23 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
   const running = status?.state === "running" || status?.state === "stopping";
   const activeConfig = running && status?.config ? status.config : config;
   const currentProducts = status?.progress?.records_seen?.product ?? status?.summary?.records_seen_this_run?.product ?? 0;
-  const limit = activeConfig.mode === "full" ? 0 : Number(activeConfig.max_products || 0);
+  // The progress row describes the run, so it reads the run's own config --
+  // the form above it may already show different, unsaved settings.
+  const runConfig = status?.config || activeConfig;
+  const limit = runConfig.mode === "full" ? 0 : Number(runConfig.max_products || 0);
   const progress = limit ? Math.min(100, Math.round((currentProducts / limit) * 100)) : 0;
   const logLines = useMemo(() => (logs || "").split("\n").filter(Boolean).slice(-7).reverse(), [logs]);
   const quality = catalog.quality || {};
   const enrichment = catalog.enrichment || {};
+  const timeline = status?.timeline;
+  const media = status?.progress || {};
+  // Prefer the product limit when there is one, otherwise fall back to how far
+  // through the run's named steps we are.
+  const stepPercent = limit
+    ? progress
+    : timeline?.steps
+      ? Math.round((timeline.completed / timeline.steps) * 100)
+      : null;
 
   function update(key, value) {
     setConfig((current) => ({ ...current, [key]: value }));
@@ -55,14 +68,38 @@ export function OverviewPage({ status, settings, products, logs, busy, onStart, 
           <Field label="Product limit" hint="0 means full catalog"><input type="number" min="0" value={activeConfig.mode === "full" ? 0 : activeConfig.max_products ?? 5} disabled={running || activeConfig.mode === "full"} onChange={(event) => update("max_products", Number(event.target.value))} /></Field>
           <Field label="Mode"><select value={activeConfig.mode || "test"} disabled={running} onChange={(event) => updateMode(event.target.value)}><option value="test">Test run</option><option value="full">Full WooCommerce catalog</option><option value="enrich">Enrich saved catalog</option></select></Field>
           <Field label="Resume from checkpoint"><select value={activeConfig.resume_checkpoint ? "yes" : "no"} disabled={running || activeConfig.mode === "enrich"} onChange={(event) => update("resume_checkpoint", event.target.value === "yes")}><option value="yes">Latest checkpoint</option><option value="no">Start fresh</option></select></Field>
-          <div className="run-state"><StatusMark state={status?.state || "idle"} /><small>{status?.message || "Ready to start."}</small><small>{status?.started_at ? `Started ${formatDate(status.started_at)}` : "No active run"}</small></div>
+          <div className="run-state">
+            <StatusMark state={status?.state || "idle"} />
+            <small>{status?.message || "Ready to start."}</small>
+            <small>{status?.started_at ? `Started ${formatDate(status.started_at)}` : "No active run"}</small>
+          </div>
         </div>
         <div className="progress-row">
-          <strong>Progress</strong><span className="progress-value">{limit ? `${progress}%` : running ? "Running" : "—"}</span>
-          <div className="progress-track"><span style={{ width: `${limit ? progress : running ? 16 : 0}%` }} /></div>
+          <strong>Progress</strong>
+          <span className="progress-value">{stepPercent == null ? (running ? "Running" : "—") : `${stepPercent}%`}</span>
+          <div className="progress-track"><span style={{ width: `${stepPercent ?? (running ? 16 : 0)}%` }} /></div>
           <span>{formatNumber(currentProducts)}{limit ? ` / ${formatNumber(limit)}` : " products"}</span>
           <button className="text-button" onClick={() => onNavigate("runs")}>View crawl runs <Icon name="chevron" size={15} /></button>
         </div>
+      </section>
+
+      <section className="run-detail">
+        <section className="panel panel--timeline">
+          <div className="panel-header">
+            <h2>What the run is doing</h2>
+            <CurrentStep status={status} />
+          </div>
+          <RunTimeline timeline={timeline} />
+          {running ? (
+            <div className="live-counters">
+              <div><small>Products saved</small><strong>{formatNumber(media.records_seen?.product)}</strong></div>
+              <div><small>Images stored</small><strong>{formatNumber(media.media_stored)}</strong></div>
+              <div className={media.media_failed ? "metric-warning" : ""}><small>Images failed</small><strong>{formatNumber(media.media_failed)}</strong></div>
+              <div><small>Diagnostics</small><strong>{formatNumber(media.records_seen?.diagnostic)}</strong></div>
+            </div>
+          ) : null}
+        </section>
+        <StorefrontPanel storefront={status?.storefront} catalog={catalog} onNavigate={onNavigate} />
       </section>
 
       <section className="coverage-strip" aria-label="Catalog data coverage">

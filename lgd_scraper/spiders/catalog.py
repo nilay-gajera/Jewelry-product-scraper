@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,6 +18,7 @@ from scrapy.http import Response
 from scrapy_playwright.page import PageMethod
 
 from lgd_scraper.catalog_rules import assign_loose_diamond_category
+from lgd_scraper.run_progress import PhaseTracker, phases_for_mode
 
 
 def _truthy(value: Any) -> bool:
@@ -117,6 +119,29 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         self.block_reason: str | None = None
         self.seen_product_ids: set[str] = set()
 
+        # Storefront availability. ``None`` means the scan has not run or could
+        # not be completed, in which case no product may be called offline.
+        self.live_product_ids: set[str] | None = None
+        self.storefront_scan_pages = 0
+        self.storefront_scan_total_pages = 0
+        self.products_offline = 0
+        self.products_back_online = 0
+        self.products_skipped_offline = 0
+
+        self.mode = (
+            "enrich"
+            if self.enrichment_mode
+            else "full"
+            if not self.max_products
+            else "test"
+        )
+        self.progress = PhaseTracker(
+            Path(self.output_dir).resolve() / "progress.json",
+            phases_for_mode(self.mode),
+            run_id=os.getenv("SCRAPER_RUN_ID"),
+            mode=self.mode,
+        )
+
         if self.authenticated:
             raw = f"{self.consumer_key}:{self.consumer_secret}".encode("utf-8")
             self.authorization = "Basic " + base64.b64encode(raw).decode("ascii")
@@ -183,6 +208,10 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             yield from self._start_enrichment_requests()
             return
 
+        self.progress.start(
+            "discover",
+            "Requesting the WooCommerce product, category and attribute APIs",
+        )
         if self.authenticated:
             product_categories = self.category_ids or [None]
             for category_id in product_categories:
@@ -229,14 +258,23 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 meta={"api_kind": "store", "page": 1},
             )
 
-    def _start_enrichment_requests(self):
-        """Refresh saved products without recrawling the catalog.
+    # ------------------------------------------------------------------
+    # Enrichment: storefront availability scan, then live pages only
+    # ------------------------------------------------------------------
 
-        Uses SQL-level filtering and LIMIT/OFFSET batching to keep memory
-        usage bounded even for 40K+ product catalogs.
+    def _catalog_database_path(self) -> Path:
+        return Path(self.output_dir).resolve() / "catalog.sqlite"
+
+    def _start_enrichment_requests(self):
+        """Refresh saved products from their live storefront pages.
+
+        Products that have been switched off in the storefront no longer have a
+        reachable page, so a first pass lists everything the storefront still
+        publishes.  Enrichment then only requests pages that can actually
+        answer, instead of spending one failed request per hidden product.
         """
 
-        database_path = Path(self.output_dir).resolve() / "catalog.sqlite"
+        database_path = self._catalog_database_path()
         self.logger.info(
             "Enrichment: opening catalog checkpoint at %s (exists=%s)",
             database_path,
@@ -245,6 +283,9 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         if not database_path.exists():
             self.logger.warning(
                 "Enrichment: catalog checkpoint not found at %s", database_path
+            )
+            self.progress.fail(
+                "storefront_scan", "No saved catalog checkpoint to enrich."
             )
             yield {
                 "_record_type": "diagnostic",
@@ -255,85 +296,143 @@ class WooCommerceCatalogSpider(scrapy.Spider):
             }
             return
 
+        self.live_product_ids = set()
+        self.progress.start(
+            "storefront_scan", "Listing products published on the storefront"
+        )
+        yield self._storefront_index_request(page=1)
+
+    def _storefront_index_request(self, page: int) -> Request:
+        """One page of the storefront's published product index.
+
+        ``_fields`` keeps the payload to identifiers even for a 40K catalog.
+        WooCommerce ignores the parameter if it does not support it, which
+        costs bandwidth but still returns the ids the scan needs.
+        """
+
+        if self.authenticated:
+            url = self._url(
+                "wp-json/wc/v3/products",
+                per_page=100,
+                page=page,
+                status="publish",
+                _fields="id,sku,permalink,status",
+            )
+        else:
+            url = self._url(
+                "wp-json/wc/store/v1/products",
+                per_page=100,
+                page=page,
+                _fields="id,sku,permalink",
+            )
+        return self._api_request(
+            url,
+            self.parse_storefront_index,
+            meta={
+                "api_kind": "rest" if self.authenticated else "store",
+                "request_kind": "storefront_index",
+                "page": page,
+            },
+            errback=self.errback_storefront_index,
+        )
+
+    def errback_storefront_index(self, failure):
+        """A transport failure leaves availability unknown, not offline.
+
+        Enrichment still has to run; without this the whole pass would end at
+        the scan and refresh nothing.  A half-finished scan is discarded too,
+        because the ids it did not reach would look switched off.
+        """
+
+        self.live_product_ids = None
+        self.progress.skip(
+            "storefront_scan",
+            "Storefront index unreachable; every saved product will be tried.",
+        )
+        yield {
+            "_record_type": "diagnostic",
+            "kind": "storefront_index_failed",
+            "url": failure.request.url,
+            "status": None,
+            "message": (
+                "The storefront product index could not be reached "
+                f"({failure.value}). Availability is unknown, so every saved "
+                "product will be requested."
+            ),
+            "request_kind": "storefront_index",
+        }
+        yield from self._schedule_enrichment()
+
+    def parse_storefront_index(self, response: Response):
+        """Accumulate the ids the storefront still publishes."""
+
+        payload = self._json_list(response)
+        page = int(response.meta.get("page", 1))
+
+        if payload is None:
+            # Without a trustworthy live index every product could be wrongly
+            # called offline, so abandon the scan and enrich everything -- the
+            # previous behaviour -- rather than skip real products.
+            self.live_product_ids = None
+            self.progress.skip(
+                "storefront_scan",
+                "Storefront index unavailable; every saved product will be tried.",
+            )
+            yield self._diagnostic_for_response(
+                response,
+                "storefront_index_unavailable",
+                "The storefront product index could not be read, so availability "
+                "is unknown. Every saved product will be requested.",
+            )
+            yield from self._schedule_enrichment()
+            return
+
+        assert self.live_product_ids is not None
+        for raw_product in payload:
+            product_id = str(raw_product.get("id") or "")
+            if product_id:
+                self.live_product_ids.add(product_id)
+
+        self.storefront_scan_pages = page
+        total_pages = int(response.headers.get("X-WP-TotalPages", b"1") or 1)
+        self.storefront_scan_total_pages = total_pages
+        self.progress.update(
+            "storefront_scan",
+            processed=page,
+            total=total_pages,
+            detail=(
+                f"{len(self.live_product_ids):,} live products found "
+                f"(page {page} of {total_pages})"
+            ),
+        )
+
+        if payload and page < total_pages:
+            yield self._storefront_index_request(page + 1)
+            return
+
+        self.progress.finish(
+            "storefront_scan",
+            f"{len(self.live_product_ids):,} products are live on the storefront.",
+        )
+        yield from self._schedule_enrichment()
+
+    def _schedule_enrichment(self):
+        """Walk the saved catalog and request only the pages that can answer.
+
+        Reads in batches so a 40K-product catalog never lands in memory at once.
+        """
+
+        database_path = self._catalog_database_path()
+        live_ids = self.live_product_ids
+        self.progress.start("enrich", "Selecting saved products to refresh")
+
         try:
             connection = sqlite3.connect(
                 f"file:{database_path}?mode=ro", uri=True, timeout=5
             )
-            try:
-                total_count = connection.execute(
-                    "SELECT COUNT(*) FROM products"
-                ).fetchone()[0]
-                self.logger.info(
-                    "Enrichment: catalog contains %d products", total_count
-                )
-                columns = {
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(products)"
-                    ).fetchall()
-                }
-                has_url_col = "url" in columns
-
-                # Filter at SQL level if column exists: only load products that have a URL.
-                skipped_no_url = (
-                    connection.execute(
-                        "SELECT COUNT(*) FROM products WHERE url IS NULL OR url = ''"
-                    ).fetchone()[0]
-                    if has_url_col
-                    else 0
-                )
-
-                batch_size = 500
-                offset = 0
-                while True:
-                    if self.max_products and self.products_scheduled >= self.max_products:
-                        break
-                    query = (
-                        "SELECT raw_json FROM products "
-                        "WHERE url IS NOT NULL AND url != '' "
-                        "ORDER BY id LIMIT ? OFFSET ?"
-                        if has_url_col
-                        else "SELECT raw_json FROM products ORDER BY id LIMIT ? OFFSET ?"
-                    )
-                    rows = connection.execute(query, (batch_size, offset)).fetchall()
-                    if not rows:
-                        break
-                    offset += len(rows)
-                    for (raw_json,) in rows:
-                        if self.max_products and self.products_scheduled >= self.max_products:
-                            break
-                        try:
-                            product = json.loads(raw_json)
-                        except (json.JSONDecodeError, TypeError):
-                            continue
-                        if not isinstance(product, dict) or not product.get("url"):
-                            if not has_url_col:
-                                skipped_no_url += 1
-                            continue
-                        if not self._needs_enrichment(product):
-                            self.products_already_enriched += 1
-                            continue
-                        product["_record_type"] = "product"
-                        self.products_scheduled += 1
-                        target_url = (
-                            self._diamond_page_url(product)
-                            if product.get("product_family") == "loose_diamond" and product.get("sku")
-                            else str(product["url"])
-                        )
-                        yield self._page_request(
-                            target_url, product, dont_filter=True
-                        )
-                self.logger.info(
-                    "Enrichment: scheduled=%d, already_enriched=%d, "
-                    "skipped_no_url=%d",
-                    self.products_scheduled,
-                    self.products_already_enriched,
-                    skipped_no_url,
-                )
-            finally:
-                connection.close()
         except sqlite3.Error as exc:
             self.logger.error("Enrichment: catalog read failed: %s", exc)
+            self.progress.fail("enrich", f"The saved catalog could not be read: {exc}")
             yield {
                 "_record_type": "diagnostic",
                 "kind": "enrichment_catalog_unreadable",
@@ -342,6 +441,167 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 "message": f"The existing catalog could not be read: {exc}",
             }
             return
+
+        try:
+            total_count = connection.execute(
+                "SELECT COUNT(*) FROM products"
+            ).fetchone()[0]
+            self.logger.info("Enrichment: catalog contains %d products", total_count)
+            self.progress.update("enrich", total=total_count)
+
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(products)").fetchall()
+            }
+            has_url_col = "url" in columns
+            skipped_no_url = (
+                connection.execute(
+                    "SELECT COUNT(*) FROM products WHERE url IS NULL OR url = ''"
+                ).fetchone()[0]
+                if has_url_col
+                else 0
+            )
+
+            batch_size = 500
+            offset = 0
+            examined = 0
+            while True:
+                if self.max_products and self.products_scheduled >= self.max_products:
+                    break
+                query = (
+                    "SELECT raw_json FROM products "
+                    "WHERE url IS NOT NULL AND url != '' "
+                    "ORDER BY id LIMIT ? OFFSET ?"
+                    if has_url_col
+                    else "SELECT raw_json FROM products ORDER BY id LIMIT ? OFFSET ?"
+                )
+                rows = connection.execute(query, (batch_size, offset)).fetchall()
+                if not rows:
+                    break
+                offset += len(rows)
+                for (raw_json,) in rows:
+                    if (
+                        self.max_products
+                        and self.products_scheduled >= self.max_products
+                    ):
+                        break
+                    try:
+                        product = json.loads(raw_json)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(product, dict) or not product.get("url"):
+                        if not has_url_col:
+                            skipped_no_url += 1
+                        continue
+
+                    examined += 1
+                    product_id = str(product.get("id") or "")
+                    is_live = live_ids is None or product_id in live_ids
+
+                    if not is_live:
+                        self.products_skipped_offline += 1
+                        updated = self._mark_storefront_status(product, "offline")
+                        if updated is not None:
+                            self.products_offline += 1
+                            yield updated
+                        self._report_enrichment_progress(examined, total_count)
+                        continue
+
+                    if not self._needs_enrichment(product):
+                        self.products_already_enriched += 1
+                        updated = self._mark_storefront_status(product, "live")
+                        if updated is not None:
+                            self.products_back_online += 1
+                            yield updated
+                        self._report_enrichment_progress(examined, total_count)
+                        continue
+
+                    product["_record_type"] = "product"
+                    product["storefront_status"] = "live"
+                    product["storefront_checked_at"] = self._timestamp()
+                    self.products_scheduled += 1
+                    target_url = (
+                        self._diamond_page_url(product)
+                        if product.get("product_family") == "loose_diamond"
+                        and product.get("sku")
+                        else str(product["url"])
+                    )
+                    yield self._page_request(target_url, product, dont_filter=True)
+                    self._report_enrichment_progress(examined, total_count)
+
+            self.logger.info(
+                "Enrichment: scheduled=%d, already_enriched=%d, "
+                "offline_skipped=%d, skipped_no_url=%d",
+                self.products_scheduled,
+                self.products_already_enriched,
+                self.products_skipped_offline,
+                skipped_no_url,
+            )
+            self.progress.update(
+                "enrich",
+                processed=examined,
+                total=total_count,
+                detail=(
+                    f"{self.products_scheduled:,} live products queued, "
+                    f"{self.products_skipped_offline:,} skipped as offline, "
+                    f"{self.products_already_enriched:,} already current"
+                ),
+            )
+        finally:
+            connection.close()
+            self.progress.set_extra(storefront=self.storefront_summary())
+            self.progress.flush()
+
+    def _report_enrichment_progress(self, examined: int, total: int) -> None:
+        if examined % 200:
+            return
+        self.progress.update(
+            "enrich",
+            processed=examined,
+            total=total,
+            detail=(
+                f"{self.products_scheduled:,} queued, "
+                f"{self.products_skipped_offline:,} offline, "
+                f"{self.products_already_enriched:,} already current"
+            ),
+        )
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(UTC).isoformat()
+
+    def _mark_storefront_status(
+        self, product: dict[str, Any], status: str
+    ) -> dict[str, Any] | None:
+        """Return the product to re-save only when its availability changed.
+
+        Rewriting every unchanged row on each run would cost one SQLite upsert
+        per product for no new information.
+        """
+
+        if str(product.get("storefront_status") or "") == status:
+            return None
+        product = dict(product)
+        product["_record_type"] = "product"
+        product["storefront_status"] = status
+        product["storefront_checked_at"] = self._timestamp()
+        return product
+
+    def storefront_summary(self) -> dict[str, Any]:
+        return {
+            "scanned": self.live_product_ids is not None,
+            "live_products": (
+                len(self.live_product_ids)
+                if self.live_product_ids is not None
+                else None
+            ),
+            "index_pages_read": self.storefront_scan_pages,
+            "index_pages_total": self.storefront_scan_total_pages,
+            "skipped_offline": self.products_skipped_offline,
+            "newly_offline": self.products_offline,
+            "back_online": self.products_back_online,
+        }
+
 
     def _needs_enrichment(self, product: dict[str, Any]) -> bool:
         try:
@@ -368,6 +628,13 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 )
             return
 
+        if self.progress.snapshot()["phase"] == "discover":
+            self.progress.finish(
+                "discover", "Catalog APIs answered; collecting products."
+            )
+            self.progress.start("products", "Collecting products")
+
+        # Everything the product API returns is published on the storefront.
         for raw_product in payload:
             if self.max_products and self.products_scheduled >= self.max_products:
                 break
@@ -384,6 +651,8 @@ class WooCommerceCatalogSpider(scrapy.Spider):
                 self.seen_product_ids.add(product_id)
             self.products_scheduled += 1
             product = self._normalize_product(raw_product, api_kind)
+            product["storefront_status"] = "live"
+            product["storefront_checked_at"] = self._timestamp()
 
             if api_kind == "rest" and product.get("type") == "variable":
                 yield self._api_request(
@@ -2228,6 +2497,7 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         ):
             return
         self.products_emitted += 1
+        self._report_emitted(product)
         # Strip bulky raw payloads that duplicate normalized data. These are
         # only useful during spider processing and roughly double the SQLite
         # checkpoint size if persisted.
@@ -2235,6 +2505,27 @@ class WooCommerceCatalogSpider(scrapy.Spider):
         for variation in product.get("variations") or []:
             variation.pop("raw", None)
         yield product
+
+    def _report_emitted(self, product: dict[str, Any]) -> None:
+        """Name the product currently being written, for the dashboard."""
+
+        key = "enrich" if self.enrichment_mode else "products"
+        target = self.max_products or None
+        self.progress.update(
+            key,
+            processed=self.products_emitted,
+            total=target if not self.enrichment_mode else None,
+            detail=f"Saved {product.get('name') or product.get('id') or 'product'}",
+        )
+        self.progress.set_extra(
+            products_emitted=self.products_emitted,
+            products_scheduled=self.products_scheduled,
+            current_product={
+                "id": product.get("id"),
+                "name": product.get("name"),
+                "url": product.get("url"),
+            },
+        )
 
     @staticmethod
     def _apply_resolved_variation_galleries(

@@ -12,6 +12,20 @@ from lgd_scraper.pipelines import CatalogMediaPipeline
 from lgd_scraper.spiders.catalog import WooCommerceCatalogSpider
 
 
+def storefront_index_response(request, product_ids, total_pages: int = 1):
+    """A storefront product index page listing the given live product ids."""
+
+    return HtmlResponse(
+        url=request.url,
+        body=json.dumps(
+            [{"id": product_id, "sku": f"SKU-{product_id}"} for product_id in product_ids]
+        ).encode(),
+        encoding="utf-8",
+        headers={"X-WP-TotalPages": str(total_pages)},
+        request=request,
+    )
+
+
 def response_for(url: str, body: str, status: int = 200) -> HtmlResponse:
     request = Request(url=url)
     return HtmlResponse(
@@ -554,11 +568,22 @@ def test_enrichment_mode_updates_saved_ids_and_skips_current_schema(tmp_path):
         output_dir=str(tmp_path),
         resume_existing=True,
         enrichment_mode=True,
+        base_url="https://example.test/",
     )
-    requests = list(spider.start_requests())
+    # Enrichment now begins with a storefront availability scan.
+    scan_requests = list(spider.start_requests())
+    assert len(scan_requests) == 1
+    assert "wp-json/wc/store/v1/products" in scan_requests[0].url
+
+    results = list(
+        spider.parse_storefront_index(
+            storefront_index_response(scan_requests[0], [42, 43])
+        )
+    )
+    page_requests = [item for item in results if hasattr(item, "url")]
 
     assert spider.existing_product_ids == set()
-    assert [request.url for request in requests] == [pending["url"]]
+    assert [request.url for request in page_requests] == [pending["url"]]
     assert spider.products_scheduled == 1
     assert spider.products_already_enriched == 1
     assert list(spider._emit_product(pending))[0]["id"] == "42"

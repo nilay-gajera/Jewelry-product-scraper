@@ -4,14 +4,16 @@ import { api, downloadMasterExport } from "../api.js";
 import { Icon } from "../icons.jsx";
 import { Button, EmptyState, LoadingLine, formatDate } from "../components/Ui.jsx";
 import { ProductThumb } from "./OverviewPage.jsx";
+import { StorefrontBadge } from "../components/RunTimeline.jsx";
 
-export function ProductsPage({ initialProductId = "", crawlActive = false, onError, onDeleted }) {
+export function ProductsPage({ initialProductId = "", initialFilters = null, crawlActive = false, onError, onDeleted }) {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [type, setType] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [stockStatus, setStockStatus] = useState("");
   const [coverage, setCoverage] = useState("");
+  const [storefront, setStorefront] = useState(initialFilters?.storefront || "");
   const [sort, setSort] = useState("name_asc");
   const [filterOptions, setFilterOptions] = useState({ categories: [], types: [], stock_statuses: [] });
   const [page, setPage] = useState(1);
@@ -42,6 +44,7 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
       category_id: categoryId,
       stock_status: stockStatus,
       coverage,
+      storefront,
       sort,
       page: String(page),
       page_size: "25",
@@ -51,7 +54,7 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
       .catch(onError)
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [deferredQuery, type, categoryId, stockStatus, coverage, sort, page, onError, refreshKey]);
+  }, [deferredQuery, type, categoryId, stockStatus, coverage, storefront, sort, page, onError, refreshKey]);
 
   useEffect(() => {
     if (!selectedId) { setDetail(null); return; }
@@ -64,6 +67,13 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
   }, [selectedId, onError]);
 
   useEffect(() => {
+    if (!initialFilters) return;
+    setStorefront(initialFilters.storefront || "");
+    setPage(1);
+    setSelectedIds(new Set());
+  }, [initialFilters]);
+
+  useEffect(() => {
     if (!crawlActive) return;
     setSelectedIds(new Set());
     setConfirmingBulkDelete(false);
@@ -72,7 +82,7 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
   const pages = Math.max(1, Math.ceil(data.total / data.page_size));
   const visibleIds = useMemo(() => data.items.map((product) => String(product.id)), [data.items]);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
-  const activeFilterCount = [query, type, categoryId, stockStatus, coverage].filter(Boolean).length;
+  const activeFilterCount = [query, type, categoryId, stockStatus, coverage, storefront].filter(Boolean).length;
 
   function updateFilter(setter, value) {
     setter(value);
@@ -86,6 +96,7 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
     setCategoryId("");
     setStockStatus("");
     setCoverage("");
+    setStorefront("");
     setPage(1);
     setSelectedIds(new Set());
   }
@@ -164,14 +175,15 @@ export function ProductsPage({ initialProductId = "", crawlActive = false, onErr
               <label className="select-control"><select aria-label="Filter by category" value={categoryId} onChange={(event) => updateFilter(setCategoryId, event.target.value)}><option value="">All categories</option>{filterOptions.categories.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.count})</option>)}</select></label>
               <label className="select-control"><select aria-label="Filter by stock status" value={stockStatus} onChange={(event) => updateFilter(setStockStatus, event.target.value)}><option value="">All stock states</option>{filterOptions.stock_statuses.map((item) => <option key={item.value} value={item.value}>{item.value} ({item.count})</option>)}</select></label>
               <label className="select-control"><select aria-label="Filter by data coverage" value={coverage} onChange={(event) => updateFilter(setCoverage, event.target.value)}><option value="">All data coverage</option><option value="complete">Core data complete</option><option value="missing_images">Missing images</option><option value="missing_categories">Missing categories</option><option value="missing_attributes">Missing attributes</option><option value="missing_variations">Missing variations</option></select></label>
+              <label className="select-control"><select aria-label="Filter by storefront availability" value={storefront} onChange={(event) => updateFilter(setStorefront, event.target.value)}><option value="">All storefront states</option><option value="live">Live on the site</option><option value="offline">Switched off</option><option value="unknown">Not checked yet</option></select></label>
               <button className="filter-reset" disabled={!activeFilterCount} onClick={clearFilters}>{activeFilterCount ? `Clear filters (${activeFilterCount})` : "No filters applied"}</button>
             </div>
             {selectedIds.size && !crawlActive ? <div className="product-toolbar__bulk"><span><strong>{selectedIds.size}</strong> product{selectedIds.size === 1 ? "" : "s"} selected</span><button onClick={() => setSelectedIds(new Set())}>Clear selection</button><Button icon="trash" tone="danger" onClick={() => setConfirmingBulkDelete(true)}>Delete selected</Button></div> : null}
           </div>
           {crawlActive ? <div className="security-notice"><Icon name="alert" /><span><strong>Catalog crawl in progress.</strong> Product deletion and selection are disabled until the checkpoint is closed safely.</span></div> : null}
           {loading ? <LoadingLine /> : null}
-          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th className="product-select"><input type="checkbox" disabled={crawlActive} checked={allVisibleSelected} onChange={toggleVisibleProducts} aria-label="Select all products on this page" /></th><th>Product</th><th>Type</th><th>Price</th><th>Variations</th><th>Images</th><th>Categories</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
-            {data.items.map((product) => { const productId = String(product.id); return <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td className="product-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={crawlActive} checked={selectedIds.has(productId)} onChange={() => toggleProduct(productId)} aria-label={`Select ${product.name || product.id}`} /></td><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.price ? `${product.currency ? `${product.currency} ` : ""}${product.price}` : "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>; })}
+          {data.items.length ? <div className="table-scroll"><table className="products-table"><thead><tr><th className="product-select"><input type="checkbox" disabled={crawlActive} checked={allVisibleSelected} onChange={toggleVisibleProducts} aria-label="Select all products on this page" /></th><th>Product</th><th>Type</th><th>Price</th><th>Variations</th><th>Images</th><th>Categories</th><th>Storefront</th><th>Quality</th><th>Updated</th><th /></tr></thead><tbody>
+            {data.items.map((product) => { const productId = String(product.id); return <tr key={product.id} className={selectedId === product.id ? "clickable-row selected-row" : "clickable-row"} onClick={() => setSelectedId(product.id)}><td className="product-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={crawlActive} checked={selectedIds.has(productId)} onChange={() => toggleProduct(productId)} aria-label={`Select ${product.name || product.id}`} /></td><td><div className="product-cell"><ProductThumb product={product} /><span><strong>{product.name || product.id}</strong><small>{product.sku ? `SKU: ${product.sku}` : `ID: ${product.id}`}</small></span></div></td><td>{product.type || "—"}</td><td>{product.price ? `${product.currency ? `${product.currency} ` : ""}${product.price}` : "—"}</td><td>{product.variation_count}</td><td>{product.image_count}</td><td>{product.categories?.join(" › ") || "—"}</td><td><StorefrontBadge status={product.storefront_status} /></td><td><span className={`quality-score quality-score--${product.quality.score >= 90 ? "good" : product.quality.score >= 70 ? "warn" : "bad"}`}>{product.quality.score}%</span></td><td>{formatDate(product.updated)}</td><td><Icon name="chevron" /></td></tr>; })}
           </tbody></table></div> : <EmptyState title="No matching products" body="Change the filter or run the scraper to populate products." />}
           <footer className="pagination"><span>{data.total ? `${(page - 1) * data.page_size + 1}–${Math.min(page * data.page_size, data.total)} of ${data.total}` : "0 products"}</span><div><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)} aria-label="Previous page"><Icon name="chevron" className="icon-reverse" /></button><strong>{page}</strong><button disabled={page >= pages} onClick={() => setPage((value) => value + 1)} aria-label="Next page"><Icon name="chevron" /></button></div></footer>
         </section>
@@ -212,7 +224,7 @@ function ProductInspector({ product, crawlActive, onClose, onDelete, onError }) 
 
   return (
     <aside className="product-inspector">
-      <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}</div><div className="inspector-actions">{product && !crawlActive ? <button className="icon-button icon-button--danger" onClick={() => setConfirmingDelete(true)} aria-label="Delete product"><Icon name="trash" /></button> : null}<button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></div></header>
+      <header><div><h2>{product ? product.name || product.id || "Unnamed product" : "Loading product…"}</h2>{product ? <small>{product.sku ? `SKU: ${product.sku}` : `Source ID: ${product.id}`}</small> : null}{product ? <div className="inspector-storefront"><StorefrontBadge status={product.storefront_status} />{product.storefront_status === "offline" ? <small>Not published on the storefront, so its page cannot be read. Saved data is kept.</small> : product.storefront_checked_at ? <small>Checked {formatDate(product.storefront_checked_at)}</small> : <small>Availability not checked yet.</small>}</div> : null}</div><div className="inspector-actions">{product && !crawlActive ? <button className="icon-button icon-button--danger" onClick={() => setConfirmingDelete(true)} aria-label="Delete product"><Icon name="trash" /></button> : null}<button className="icon-button" onClick={onClose} aria-label="Close product"><Icon name="close" /></button></div></header>
       {!product ? <LoadingLine /> : <>
         <div className="inspector-hero">{featured ? <img src={featured.display_url || featured.source_url} alt={featured.alt || product.name || "Product"} /> : <span><Icon name="image" size={38} /></span>}</div>
         <div className="media-rail">{activeMedia.slice(0, 8).map((item) => <img key={item.source_url} src={item.display_url || item.source_url} alt={item.alt || ""} loading="lazy" />)}{activeMedia.length > 8 ? <span>+{activeMedia.length - 8}</span> : null}</div>

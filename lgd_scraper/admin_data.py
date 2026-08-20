@@ -245,6 +245,7 @@ def _empty_summary() -> dict[str, Any]:
             "missing_attributes": 0,
             "missing_variations": 0,
         },
+        "storefront": {"live": 0, "offline": 0, "unknown": 0},
         "enrichment": {
             "schema_version": 1,
             "candidates": 0,
@@ -332,6 +333,28 @@ def _catalog_summary_mysql(connection) -> dict[str, Any]:
         if row:
             empty["enrichment"]["variation_gallery_images"] = row[0]
             empty["enrichment"]["media_missing_storage"] = row[1]
+
+    if _mysql_table_exists(connection, "products"):
+        row = _mysql_fetchone(
+            connection,
+            """
+            SELECT
+                COALESCE(SUM(s = 'live'), 0),
+                COALESCE(SUM(s = 'offline'), 0),
+                COALESCE(SUM(s IS NULL OR s NOT IN ('live', 'offline')), 0)
+            FROM (
+                SELECT JSON_UNQUOTE(
+                    JSON_EXTRACT(raw_json, '$.storefront_status')
+                ) AS s FROM products
+            ) AS storefront
+            """,
+        )
+        if row:
+            empty["storefront"] = {
+                "live": int(row[0]),
+                "offline": int(row[1]),
+                "unknown": int(row[2]),
+            }
 
     quality_checks = {
         "missing_images": "SELECT COUNT(*) FROM products p WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id)",
@@ -422,6 +445,28 @@ def _catalog_summary_sqlite(database_path: Path) -> dict[str, Any]:
             enrichment["remaining"] = max(
                 0, enrichment["candidates"] - enrichment["completed"]
             )
+
+        if "products" in table_names:
+            # ponytail: json_extract scan, add a storefront_status column if the
+            # catalog outgrows a few hundred thousand products.
+            storefront_row = connection.execute(
+                """
+                SELECT
+                    COALESCE(SUM(status = 'live'), 0),
+                    COALESCE(SUM(status = 'offline'), 0),
+                    COALESCE(SUM(status IS NULL OR status NOT IN ('live', 'offline')), 0)
+                FROM (
+                    SELECT CASE WHEN json_valid(raw_json)
+                        THEN json_extract(raw_json, '$.storefront_status') END AS status
+                    FROM products
+                )
+                """
+            ).fetchone()
+            empty["storefront"] = {
+                "live": storefront_row[0],
+                "offline": storefront_row[1],
+                "unknown": storefront_row[2],
+            }
 
         variation_columns = (
             {
@@ -514,6 +559,7 @@ def list_products(
     category_id: str = "",
     stock_status: str = "",
     coverage: str = "",
+    storefront: str = "",
     sort: str = "name_asc",
     page: int = 1,
     page_size: int = 25,
@@ -525,14 +571,16 @@ def list_products(
             return _list_products_mysql(
                 mysql_conn, query=query, product_type=product_type,
                 category_id=category_id, stock_status=stock_status,
-                coverage=coverage, sort=sort, page=page, page_size=page_size,
+                coverage=coverage, storefront=storefront,
+                sort=sort, page=page, page_size=page_size,
             )
         except Exception as exc:
             _LOGGER.warning("MySQL list_products failed, falling back: %s", exc)
     return _list_products_sqlite(
         database_path, query=query, product_type=product_type,
         category_id=category_id, stock_status=stock_status,
-        coverage=coverage, sort=sort, page=page, page_size=page_size,
+        coverage=coverage, storefront=storefront,
+        sort=sort, page=page, page_size=page_size,
     )
 
 
@@ -564,6 +612,8 @@ def _build_product_item(row_dict: dict[str, Any]) -> dict[str, Any]:
             item.get("name") for item in product.get("categories") or []
         ],
         "updated": product.get("date_modified"),
+        "storefront_status": product.get("storefront_status") or "unknown",
+        "storefront_checked_at": product.get("storefront_checked_at"),
         "quality": quality_for(product),
     }
 
@@ -576,6 +626,7 @@ def _list_products_mysql(
     category_id: str,
     stock_status: str,
     coverage: str,
+    storefront: str,
     sort: str,
     page: int,
     page_size: int,
@@ -607,6 +658,13 @@ def _list_products_mysql(
     }
     if coverage in coverage_filters:
         where.append(f"({coverage_filters[coverage]})")
+    if storefront in {"live", "offline"}:
+        where.append("JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.storefront_status')) = %s")
+        parameters.append(storefront)
+    elif storefront == "unknown":
+        where.append(
+            "(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.storefront_status')) IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.storefront_status')) NOT IN ('live', 'offline'))"
+        )
 
     name_asc = "COALESCE(NULLIF(p.name, ''), p.id) ASC, p.id ASC"
     name_desc = "COALESCE(NULLIF(p.name, ''), p.id) DESC, p.id DESC"
@@ -649,6 +707,7 @@ def _list_products_sqlite(
     category_id: str,
     stock_status: str,
     coverage: str,
+    storefront: str,
     sort: str,
     page: int,
     page_size: int,
@@ -695,6 +754,13 @@ def _list_products_sqlite(
     }
     if coverage in coverage_filters:
         where.append(f"({coverage_filters[coverage]})")
+    if storefront in {"live", "offline"}:
+        where.append(f"CASE WHEN json_valid(p.raw_json) THEN json_extract(p.raw_json, '$.storefront_status') END = ?")
+        parameters.append(storefront)
+    elif storefront == "unknown":
+        where.append(
+            f"(CASE WHEN json_valid(p.raw_json) THEN json_extract(p.raw_json, '$.storefront_status') END IS NULL OR CASE WHEN json_valid(p.raw_json) THEN json_extract(p.raw_json, '$.storefront_status') END NOT IN ('live', 'offline'))"
+        )
 
     missing_coverage_count = """
         (CASE WHEN EXISTS (SELECT 1 FROM images i WHERE i.product_id = p.id) THEN 0 ELSE 1 END

@@ -16,6 +16,9 @@ const paths = {
   tag: <><path d="M20 13 13 20 4 11V4h7Z"/><circle cx="8.5" cy="8.5" r="1"/></>,
   alert: <><path d="M12 3 2.8 20h18.4Z"/><path d="M12 9v5M12 17.2v.1"/></>,
   check: <path d="m5 12 4 4L19 6"/>,
+  clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></>,
+  skip: <><path d="m6 6 7 6-7 6Z"/><path d="M18 6v12"/></>,
+  store: <><path d="M4 9h16l-1 11H5Z"/><path d="M4 9 6 4h12l2 5"/><path d="M9 13h6"/></>,
   refresh: <><path d="M20 6v5h-5"/><path d="M18.5 15.5A8 8 0 1 1 19.8 9"/></>,
   trash: <><path d="M4 7h16M9 7V4h6v3M6.5 7l1 14h9l1-14"/><path d="M10 11v6M14 11v6"/></>,
 };

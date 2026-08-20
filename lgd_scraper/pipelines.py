@@ -147,9 +147,12 @@ class CatalogWriterPipeline:
         self.handles: dict[str, Any] = {}
         self.counts: Counter[str] = Counter()
         self.diagnostics_seen: set[tuple[Any, ...]] = set()
+        self.media_stored = 0
+        self.media_failed = 0
         self.crawler = None
         self.woocommerce_counts: dict[str, int] = {}
         self.progress_path = Path("outputs/catalog/progress.json")
+        self.progress = None
         self._uncommitted = 0
 
     @classmethod
@@ -163,6 +166,7 @@ class CatalogWriterPipeline:
         self.output_dir = Path(getattr(spider, "output_dir", "outputs/catalog")).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.progress_path = self.output_dir / "progress.json"
+        self.progress = getattr(spider, "progress", None)
 
         for record_type in ("products", "categories", "attributes", "diagnostics"):
             mode = "w" if record_type == "diagnostics" else "a"
@@ -287,6 +291,10 @@ class CatalogWriterPipeline:
             self._write_jsonl("products", item)
             self._store_product(item)
             media_failures = item.get("media_download_failures") or []
+            self.media_stored += sum(
+                1 for media in item.get("media", []) if media.get("local_path")
+            )
+            self.media_failed += len(media_failures)
             if media_failures:
                 diagnostic = {
                     "_record_type": "diagnostic",
@@ -329,9 +337,9 @@ class CatalogWriterPipeline:
         if self._uncommitted >= self.COMMIT_BATCH_SIZE:
             self.connection.commit()
             self._uncommitted = 0
-        total = sum(self.counts.values())
-        if total % self.PROGRESS_INTERVAL == 0:
-            self._write_progress(item, spider=spider)
+        # The tracker throttles its own writes, so reporting every record costs
+        # a dict update rather than a file write.
+        self._write_progress(item, spider=spider)
         return item
 
     def _remember_diagnostic(self, key: tuple[Any, ...]) -> None:
@@ -342,32 +350,21 @@ class CatalogWriterPipeline:
     def _write_progress(
         self, item: dict[str, Any] | None = None, spider: Any = None
     ) -> None:
+        """Publish record counts on the shared phase tracker."""
+
+        if self.progress is None:
+            return
         resolved_spider = spider or (self.crawler.spider if self.crawler else None)
-        payload = {
-            "run_id": os.getenv("SCRAPER_RUN_ID"),
-            "state": "running",
-            "records_seen": dict(self.counts),
-            "products_scheduled": getattr(
-                resolved_spider, "products_scheduled", 0
-            ),
-            "products_already_enriched": getattr(
+        self.progress.set_extra(
+            state="running",
+            records_seen=dict(self.counts),
+            products_scheduled=getattr(resolved_spider, "products_scheduled", 0),
+            products_already_enriched=getattr(
                 resolved_spider, "products_already_enriched", 0
             ),
-            "current_product": (
-                {
-                    "id": item.get("id"),
-                    "name": item.get("name"),
-                    "url": item.get("url"),
-                }
-                if item and item.get("_record_type") == "product"
-                else None
-            ),
-        }
-        temporary = self.progress_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            media_stored=self.media_stored,
+            media_failed=self.media_failed,
         )
-        temporary.replace(self.progress_path)
 
     def _write_jsonl(self, target: str, item: dict[str, Any]) -> None:
         self.handles[target].write(_json(item) + "\n")
@@ -619,6 +616,13 @@ class CatalogWriterPipeline:
         for handle in self.handles.values():
             handle.close()
 
+        if self.progress is not None:
+            self.progress.finish(
+                "enrich" if getattr(spider, "enrichment_mode", False) else "products",
+                f"{self.counts.get('product', 0):,} product records written",
+            )
+            self.progress.start("export", "Writing CSV, JSONL and WooCommerce exports")
+
         # Export failures must never cost the run its S3 checkpoint. Record the
         # problem and keep going: the SQLite database is the durable artifact
         # and the CSVs can be rebuilt from it afterwards.
@@ -634,6 +638,8 @@ class CatalogWriterPipeline:
         except Exception as exc:
             export_error = str(exc)
             self.woocommerce_counts = {}
+            if self.progress is not None:
+                self.progress.fail("export", f"Exports could not be written: {exc}")
             self._store_diagnostic(
                 {
                     "kind": "export_failed",
@@ -643,6 +649,14 @@ class CatalogWriterPipeline:
                 }
             )
             self.connection.commit()
+
+        else:
+            if self.progress is not None:
+                self.progress.finish(
+                    "export",
+                    f"{self.woocommerce_counts.get('master_rows', 0):,} rows in the "
+                    "WooCommerce master CSV",
+                )
 
         summary = {
             "export_error": export_error,
@@ -671,24 +685,42 @@ class CatalogWriterPipeline:
                 "updated": getattr(spider, "products_emitted", 0),
                 "already_current": getattr(spider, "products_already_enriched", 0),
             },
+            "storefront": (
+                spider.storefront_summary()
+                if hasattr(spider, "storefront_summary")
+                else None
+            ),
+            "media": {"stored": self.media_stored, "failed": self.media_failed},
         }
         try:
             (self.output_dir / "crawl-summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            progress = {
-                "run_id": os.getenv("SCRAPER_RUN_ID"),
-                "state": "completed",
-                "records_seen": dict(self.counts),
-                "summary": summary,
-            }
-            self.progress_path.write_text(
-                json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
         finally:
             self.connection.close()
             self.connection = None
-            upload_final_artifacts(self.output_dir)
+            if self.progress is not None:
+                self.progress.set_extra(state="uploading", summary=summary)
+                self.progress.start("upload", "Uploading the catalog checkpoint to S3")
+            try:
+                upload_final_artifacts(self.output_dir)
+            except Exception as exc:
+                if self.progress is not None:
+                    self.progress.fail("upload", f"Upload failed: {exc}")
+                    self.progress.set_extra(state="failed")
+                    self.progress.flush()
+                raise
+            if self.progress is not None:
+                self.progress.finish("upload", "Checkpoint and artifacts uploaded.")
+                self.progress.close_open_phases()
+                self.progress.set_extra(
+                    state="completed",
+                    records_seen=dict(self.counts),
+                    media_stored=self.media_stored,
+                    media_failed=self.media_failed,
+                    summary=summary,
+                )
+                self.progress.flush()
 
     def _export_csvs(self) -> None:
         assert self.connection is not None
